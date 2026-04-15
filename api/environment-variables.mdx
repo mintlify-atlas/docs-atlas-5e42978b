@@ -1,0 +1,97 @@
+---
+title: "dflash-mlx Environment Variables Reference"
+description: "Runtime environment variables for dflash-mlx. Control context limits, draft KV cache size, verify block capping, per-cycle profiling, and draft quantization."
+---
+
+Environment variables give you fine-grained control over the dflash-mlx runtime without changing code. Every variable is read at generation time, so you can override defaults on a per-run basis by setting them in your shell before calling `dflash-serve` or invoking the Python API directly.
+
+## Variables
+
+<ParamField path="DFLASH_MAX_CTX" type="int" default="4096">
+  Maximum prompt token count for DFlash speculative decoding mode. When the input prompt is at or above this threshold, `generate_dflash_once()` automatically falls back to standard autoregressive (AR) generation and records `fallback_ar: true` with the reason in the result dict.
+
+  Increase this value when serving models on hardware with enough memory to handle longer contexts without degraded acceptance rates.
+
+  **Example:** `DFLASH_MAX_CTX=16384`
+</ParamField>
+
+<ParamField path="DFLASH_DRAFT_SINK" type="int" default="64">
+  Number of initial (sink) tokens retained in the draft model's sliding KV cache. The sink tokens anchor positional context for the draft model across long generations. Set to `0` to disable sink tokens entirely.
+
+  **Example:** `DFLASH_DRAFT_SINK=128`
+</ParamField>
+
+<ParamField path="DFLASH_DRAFT_WINDOW" type="int" default="1024">
+  Maximum number of recent tokens kept in the draft model's sliding KV cache window (excluding sink tokens). Larger windows improve acceptance at long token counts at the cost of higher draft forward-pass latency.
+
+  **Example:** `DFLASH_DRAFT_WINDOW=2048`
+</ParamField>
+
+<ParamField path="DFLASH_VERIFY_LEN" type="int" default="(block size)">
+  Caps the number of tokens sent to the target model in each verify pass. When unset or `0`, the full block is verified. Setting a value lower than the block size reduces verify latency at the cost of fewer draft tokens being checked per cycle. The effective cap is `max(1, min(block_tokens, DFLASH_VERIFY_LEN))`.
+
+  **Example:** `DFLASH_VERIFY_LEN=8`
+</ParamField>
+
+<ParamField path="DFLASH_PROFILE" type="bool" default="false">
+  Enables per-cycle profiling output in the `generate_dflash_once()` result dictionary. Truthy values are any non-empty string other than `"0"`, `"false"`, or `"no"`.
+
+  When enabled, two extra keys are added to the return dict:
+  - `cycle_profile_us` — list of per-cycle timing dicts
+  - `cycle_profile_totals_us` — summed totals across all cycles
+
+  **Example:** `DFLASH_PROFILE=1`
+</ParamField>
+
+<ParamField path="DFLASH_QUANTIZE_DRAFT" type="bool" default="false">
+  Quantizes the draft model to 4-bit weights (`bits=4`, `group_size=64`) using `mlx.nn.quantize` at load time. Reduces draft model memory footprint and can improve draft throughput on memory-constrained hardware.
+
+  This variable is checked by `load_draft_bundle()` and is overridden to `true` if the `quantize_draft=True` keyword argument is passed directly.
+
+  **Example:** `DFLASH_QUANTIZE_DRAFT=1`
+</ParamField>
+
+## Quick reference table
+
+| Variable | Default | Type | Purpose |
+|---|---|---|---|
+| `DFLASH_MAX_CTX` | `4096` | int | Prompt length threshold for DFlash vs AR fallback |
+| `DFLASH_DRAFT_SINK` | `64` | int | Sink token count in draft KV cache |
+| `DFLASH_DRAFT_WINDOW` | `1024` | int | Sliding window size in draft KV cache |
+| `DFLASH_VERIFY_LEN` | *(block size)* | int | Per-cycle verify block length cap |
+| `DFLASH_PROFILE` | *(disabled)* | bool | Enable per-cycle profiling in result dict |
+| `DFLASH_QUANTIZE_DRAFT` | *(disabled)* | bool | Quantize draft model to 4-bit at load |
+
+## Setting variables before dflash-serve
+
+```bash
+# Raise context limit for longer-prompt workloads
+export DFLASH_MAX_CTX=16384
+
+# Wider draft cache window for high-token-count sessions
+export DFLASH_DRAFT_WINDOW=2048
+export DFLASH_DRAFT_SINK=128
+
+# Enable profiling to inspect per-cycle breakdown
+export DFLASH_PROFILE=1
+
+# Quantize draft to reduce memory usage
+export DFLASH_QUANTIZE_DRAFT=1
+
+dflash-serve --model Qwen/Qwen3.5-9B --port 8000
+```
+
+You can also inline them for a single invocation:
+
+```bash
+DFLASH_MAX_CTX=16384 DFLASH_DRAFT_WINDOW=2048 \
+  dflash-serve --model mlx-community/Qwen3.5-35B-A3B-4bit --port 8000
+```
+
+<Tip>
+  If you are serving models with long system prompts or retrieval-augmented context, raise `DFLASH_MAX_CTX` to match your expected prompt length. The default of `4096` will fall back to standard AR for any prompt at or above that token count, bypassing speculative decoding entirely. For example, `DFLASH_MAX_CTX=16384` keeps DFlash active up to 16k-token prompts.
+</Tip>
+
+<Note>
+  Setting `DFLASH_PROFILE=1` adds `cycle_profile_us` and `cycle_profile_totals_us` to the dictionary returned by `generate_dflash_once()`. `cycle_profile_us` is a list of per-cycle dicts with keys `draft_us`, `verify_us`, `acceptance_us`, `hidden_extraction_us`, `rollback_us`, `other_us`, and `cycle_total_us`. `cycle_profile_totals_us` aggregates those same fields across all cycles. Profiling adds a synchronization point (`mx.eval`) inside each verify cycle, which slightly increases measured latency.
+</Note>

@@ -1,0 +1,259 @@
+---
+title: "dflash-mlx Benchmarks and Benchmark API"
+description: "DFlash benchmark results on Apple M5 Max plus the Python API for running baseline AR vs DFlash comparisons and reading per-phase timing data."
+---
+
+dflash-mlx measures generation throughput as post-prefill tokens per second — the number of tokens generated after the initial prompt prefill, divided by the wall-clock time spent in the generation loop. This metric isolates speculative decoding gains from prompt length effects and is comparable across model sizes and context lengths. Benchmarks run baseline autoregressive generation via stock `mlx_lm.stream_generate` on a pristine model load, then DFlash on a separate load of the same checkpoint, sequentially in the same process, with a thermal cooldown between runs.
+
+## Results
+
+All results are medians over 3 runs on Apple M5 Max, 64 GB unified memory, MLX 0.31.1.
+
+| Model | Tokens | Baseline | DFlash | Speedup | Acceptance |
+|---|---|---|---|---|---|
+| Qwen3.5-4B | 1024 | 53.48 tok/s | 197.49 tok/s | 3.69x | 88.67% |
+| Qwen3.5-4B | 2048 | 53.74 tok/s | 219.83 tok/s | 4.10x | 89.26% |
+| Qwen3.5-4B | 4096 | 53.58 tok/s | 155.19 tok/s | 2.83x | 87.55% |
+| Qwen3.5-9B | 1024 | 31.09 tok/s | 127.47 tok/s | 4.10x | 88.96% |
+| Qwen3.5-9B | 2048 | 30.96 tok/s | 127.07 tok/s | 4.13x | 89.36% |
+| Qwen3.5-9B | 4096 | 31.58 tok/s | 103.90 tok/s | 3.29x | 88.57% |
+| Qwen3.5-27B-4bit | 1024 | 33.24 tok/s | 65.80 tok/s | 1.98x | 89.45% |
+| Qwen3.5-27B-4bit | 2048 | 32.35 tok/s | 62.78 tok/s | 1.90x | 89.11% |
+| Qwen3.5-27B-4bit | 4096 | 29.38 tok/s | 48.89 tok/s | 1.66x | 87.99% |
+| Qwen3.5-35B-A3B-4bit | 1024 | 139.97 tok/s | 242.92 tok/s | 1.74x | 89.26% |
+| Qwen3.5-35B-A3B-4bit | 2048 | 142.12 tok/s | 240.21 tok/s | 1.69x | 88.67% |
+| Qwen3.5-35B-A3B-4bit | 4096 | 140.73 tok/s | 189.62 tok/s | 1.35x | 86.96% |
+
+<Note>
+  Speedup figures above are generation-phase speedups (post-prefill tok/s ratio). Total wall-clock speedup including prefill is lower and varies with prompt length. Full per-run JSON reports are available in `benchmark/results/`.
+</Note>
+
+## Methodology
+
+### Hardware and software
+
+- **Chip:** Apple M5 Max
+- **Memory:** 64 GB unified memory
+- **MLX version:** 0.31.1 (stock pip install)
+- **Python:** 3.10+
+
+### Protocol
+
+Each benchmark run loads a pristine copy of the target model for baseline AR generation, then unloads it and reloads it with the DFlash runtime hooks for speculative decoding. The two passes are sequential within a single Python process.
+
+- **Repeats:** 3 measured runs per configuration
+- **Reported value:** median across runs
+- **Cooldown:** 10 seconds between runs for thermal stabilization
+- **Thermal guard:** CPU scheduler limit is checked before each run; a warning is printed if thermal throttling is detected
+
+### Benchmark prompt
+
+```text
+The function $f$ satisfies the functional equation
+\[ f(x) + f(y) = f(x + y) - xy - 1 \]
+for all real numbers $x$ and $y$. If $f(1) = 1$, then find all integers $n$
+such that $f(n) = n$. Enter all such integers, separated by commas.
+Please reason step by step, and put your final answer within \boxed{}.
+```
+
+Chat templates are enabled by default. The `--no-eos` flag suppresses EOS tokens so generation always runs to the full `--max-tokens` budget, making throughput measurements deterministic across runs.
+
+### Primary metric
+
+```
+post-prefill tok/s = generation_tokens / (elapsed_us - prefill_us) × 1e6
+```
+
+`generation_tokens` is the count of tokens produced after the first token from prefill. `prefill_us` is measured separately and subtracted so TTFT variance does not skew throughput numbers.
+
+### Running the benchmark
+
+```bash
+dflash-benchmark \
+  --model Qwen/Qwen3.5-9B \
+  --draft z-lab/Qwen3.5-9B-DFlash \
+  --prompt "Your prompt here" \
+  --max-tokens 1024 \
+  --repeat 3 \
+  --no-eos
+```
+
+Results are written as JSON to `benchmark/results/<model>-<max_tokens>.json` and printed to stdout.
+
+## Python API
+
+### `generate_baseline_once()`
+
+Runs a single autoregressive generation pass using greedy decoding on the target model. Returns timing and token data suitable for direct comparison with `generate_dflash_once()`.
+
+```python
+from dflash_mlx.runtime import generate_baseline_once
+
+result = generate_baseline_once(
+    target_model=model,
+    tokenizer=tokenizer,
+    prompt="Your prompt",
+    max_new_tokens=256,
+    use_chat_template=True,         # apply tokenizer chat template
+    stop_token_ids=None,            # list[int] | None — halt on these tokens
+    suppress_token_ids=None,        # list[int] | None — mask these from logits
+    prompt_tokens_override=None,    # list[int] | None — bypass tokenization
+    quantize_kv_cache=False,        # use 8-bit quantized KV cache
+)
+```
+
+**Return keys:**
+
+| Key | Type | Description |
+|---|---|---|
+| `elapsed_us` | float | Total wall-clock time in microseconds |
+| `prefill_us` | float | Time spent on prompt prefill in microseconds |
+| `prompt_token_count` | int | Number of prompt tokens processed |
+| `generation_tokens` | int | Number of tokens generated |
+| `generated_token_ids` | list[int] | Full sequence of generated token IDs |
+| `peak_memory_gb` | float \| None | Peak unified memory in GB (if available) |
+
+### `generate_dflash_once()`
+
+Runs a single DFlash speculative decoding pass. Automatically falls back to `generate_baseline_once()` if the prompt length is at or above `DFLASH_MAX_CTX`, recording `fallback_ar: true` in the result.
+
+```python
+from dflash_mlx.runtime import generate_dflash_once
+
+result = generate_dflash_once(
+    target_model=target_model,
+    tokenizer=tokenizer,
+    draft_model=draft_model,
+    prompt="Your prompt",
+    max_new_tokens=256,
+    use_chat_template=True,
+    block_tokens=None,              # int | None — override draft block size
+    verify_chunk_tokens=None,       # int | None — chunked verify (disables speculative linear cache)
+    stop_token_ids=None,
+    suppress_token_ids=None,
+    prompt_tokens_override=None,
+    quantize_kv_cache=False,
+)
+```
+
+**Return keys relevant to benchmarking:**
+
+| Key | Type | Description |
+|---|---|---|
+| `elapsed_us` | float | Total wall-clock time in microseconds |
+| `prefill_us` | float | Prompt prefill time (inside `phase_timings_us`) |
+| `generation_tokens` | int | Total tokens committed to the output |
+| `accepted_from_draft` | int | Tokens that came directly from draft proposals |
+| `acceptance_ratio` | float | `accepted_from_draft / generation_tokens` |
+| `cycles_completed` | int | Number of draft-verify cycles completed |
+| `tokens_per_cycle` | float | Average tokens committed per cycle |
+| `phase_timings_us` | dict | Per-phase cumulative timing breakdown (see below) |
+| `cycle_profile_us` | list[dict] | Per-cycle timing dicts — only present when `DFLASH_PROFILE=1` |
+| `cycle_profile_totals_us` | dict | Summed `cycle_profile_us` totals — only present when `DFLASH_PROFILE=1` |
+
+### Computing post-prefill tok/s
+
+```python
+def post_prefill_tps(result: dict) -> float:
+    elapsed_us = result["elapsed_us"]
+    prefill_us = result["phase_timings_us"]["prefill"]
+    generation_us = max(0.0, elapsed_us - prefill_us)
+    tokens = result["generation_tokens"]
+    return (tokens / (generation_us / 1e6)) if generation_us > 0 else 0.0
+```
+
+### Example: comparing baseline vs DFlash
+
+```python
+from dflash_mlx.runtime import (
+    generate_baseline_once,
+    generate_dflash_once,
+    load_target_bundle,
+    load_draft_bundle,
+)
+
+target_model, tokenizer, _ = load_target_bundle("Qwen/Qwen3.5-9B")
+draft_model, _ = load_draft_bundle("z-lab/Qwen3.5-9B-DFlash")
+
+prompt = "Explain the Cauchy-Schwarz inequality step by step."
+
+baseline = generate_baseline_once(
+    target_model=target_model,
+    tokenizer=tokenizer,
+    prompt=prompt,
+    max_new_tokens=256,
+    use_chat_template=True,
+)
+
+dflash = generate_dflash_once(
+    target_model=target_model,
+    tokenizer=tokenizer,
+    draft_model=draft_model,
+    prompt=prompt,
+    max_new_tokens=256,
+    use_chat_template=True,
+)
+
+baseline_tps = baseline["generation_tokens"] / (
+    (baseline["elapsed_us"] - baseline["prefill_us"]) / 1e6
+)
+dflash_generation_us = dflash["elapsed_us"] - dflash["phase_timings_us"]["prefill"]
+dflash_tps = dflash["generation_tokens"] / (dflash_generation_us / 1e6)
+
+print(f"Baseline: {baseline_tps:.1f} tok/s")
+print(f"DFlash:   {dflash_tps:.1f} tok/s  ({dflash_tps/baseline_tps:.2f}x)")
+print(f"Acceptance ratio: {dflash['acceptance_ratio']:.1%}")
+```
+
+### JSON report structure
+
+The benchmark script writes a report to `benchmark/results/<model>-<max_tokens>.json`:
+
+```json
+{
+  "hardware": {
+    "chip": "Apple M5 Max",
+    "memory_gb": "64",
+    "mlx_version": "0.31.1",
+    "python": "3.11.0"
+  },
+  "config": {
+    "target_model": "Qwen/Qwen3.5-9B",
+    "draft_model": "z-lab/Qwen3.5-9B-DFlash",
+    "max_new_tokens": 1024,
+    "block_tokens": 16,
+    "cooldown": 10,
+    "repeat": 3,
+    "prompt": "...",
+    "prompt_tokens": 97,
+    "git_hash": "abc1234"
+  },
+  "runs": [...],
+  "summary": {
+    "baseline_tps_median": 31.09,
+    "dflash_tps_median": 127.47,
+    "speedup_median": 4.10,
+    "acceptance_ratio_median": 0.8896
+  }
+}
+```
+
+<Accordion title="phase_timings_us breakdown">
+
+`phase_timings_us` is a dict of cumulative microsecond timings for each phase of the generation loop. All values accumulate across the full run (not per-cycle).
+
+| Key | Description |
+|---|---|
+| `prefill` | Time for the initial target model forward pass on the full prompt |
+| `draft` | Total time in draft model forward passes (prefill + all incremental) |
+| `draft_prefill` | Draft time for the first cycle only (cold KV cache) |
+| `draft_incremental` | Draft time for all cycles after the first |
+| `verify` | Total time in target model verify passes across all cycles |
+| `replay` | Total time spent on recurrent state rollback after partial acceptance |
+| `commit` | Wall-clock time for the commit phase (includes replay; subtract `replay` to isolate bookkeeping cost) |
+
+In a typical run on a hybrid GatedDeltaNet + attention model, `verify` dominates. `replay` is usually small relative to `verify` thanks to the tape-replay rollback strategy. `draft` time grows with token count as the draft KV cache fills.
+
+When `DFLASH_PROFILE=1` is set, `cycle_profile_us` provides the same breakdown at per-cycle resolution, plus `acceptance_us` (time for greedy acceptance matching) and `hidden_extraction_us` (time to extract context features from verify hidden states).
+
+</Accordion>

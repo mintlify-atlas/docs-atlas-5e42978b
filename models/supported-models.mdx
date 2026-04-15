@@ -1,0 +1,84 @@
+---
+title: "Supported Models for dflash-mlx Inference"
+description: "Models compatible with dflash-mlx speculative decoding on Apple Silicon, including tested target/draft pairs, benchmark results, and architecture requirements."
+---
+
+dflash-mlx supports any model that has a matching DFlash draft on HuggingFace. The runtime auto-resolves the draft from a built-in registry, so most users only need to pass the target model reference. If no registry entry exists for your model, you can supply a draft explicitly with `--draft`.
+
+## Tested target/draft pairs
+
+These pairs are validated end-to-end on Apple Silicon with the DFlash runtime:
+
+| Target | Draft |
+|--------|-------|
+| `Qwen/Qwen3.5-4B` | `z-lab/Qwen3.5-4B-DFlash` |
+| `Qwen/Qwen3.5-9B` | `z-lab/Qwen3.5-9B-DFlash` |
+| `mlx-community/Qwen3.5-27B-4bit` | `z-lab/Qwen3.5-27B-DFlash` |
+| `mlx-community/Qwen3.5-35B-A3B-4bit` | `z-lab/Qwen3.5-35B-A3B-DFlash` |
+
+## Benchmark results
+
+Measured on Apple M5 Max (64 GB unified memory), MLX 0.31.1. Post-prefill tok/s reported; median of 3 runs with a 10-second cooldown between runs.
+
+| Model | Tokens | Baseline | DFlash | Speedup | Acceptance |
+|-------|--------|----------|--------|---------|------------|
+| Qwen3.5-4B | 1024 | 53.48 tok/s | 197.49 tok/s | 3.69x | 88.67% |
+| Qwen3.5-4B | 2048 | 53.74 tok/s | 219.83 tok/s | 4.10x | 89.26% |
+| Qwen3.5-4B | 4096 | 53.58 tok/s | 155.19 tok/s | 2.83x | 87.55% |
+| Qwen3.5-9B | 1024 | 31.09 tok/s | 127.47 tok/s | 4.10x | 88.96% |
+| Qwen3.5-9B | 2048 | 30.96 tok/s | 127.07 tok/s | 4.13x | 89.36% |
+| Qwen3.5-9B | 4096 | 31.58 tok/s | 103.90 tok/s | 3.29x | 88.57% |
+| Qwen3.5-27B-4bit | 1024 | 33.24 tok/s | 65.80 tok/s | 1.98x | 89.45% |
+| Qwen3.5-27B-4bit | 2048 | 32.35 tok/s | 62.78 tok/s | 1.90x | 89.11% |
+| Qwen3.5-27B-4bit | 4096 | 29.38 tok/s | 48.89 tok/s | 1.66x | 87.99% |
+| Qwen3.5-35B-A3B-4bit | 1024 | 139.97 tok/s | 242.92 tok/s | 1.74x | 89.26% |
+| Qwen3.5-35B-A3B-4bit | 2048 | 142.12 tok/s | 240.21 tok/s | 1.69x | 88.67% |
+| Qwen3.5-35B-A3B-4bit | 4096 | 140.73 tok/s | 189.62 tok/s | 1.35x | 86.96% |
+
+## Architecture compatibility
+
+<CardGroup cols={2}>
+  <Card title="Qwen3.5 (hybrid GatedDeltaNet)" icon="star">
+    Qwen3.5 models use a hybrid architecture combining GatedDeltaNet recurrent layers with standard attention layers. dflash-mlx is optimized for this architecture and activates two additional precision mechanisms:
+
+    - **Tape-replay rollback** — records an innovation tape during verification and replays only accepted steps via a custom Metal kernel, keeping GatedDeltaNet state coherent without snapshotting the full recurrent state.
+    - **JIT SDPA 2-pass** — long-context verification (`N >= 1024`) uses a custom Metal attention kernel that stays numerically aligned with stock MLX attention.
+  </Card>
+  <Card title="Qwen3 (pure attention)" icon="check">
+    Qwen3 models use a standard transformer architecture with no recurrent layers. dflash-mlx supports these models and the speculative decoding loop runs correctly, but the tape-replay rollback and SDPA precision kernels are not activated because there are no GatedDeltaNet layers to manage.
+  </Card>
+</CardGroup>
+
+<Accordion title="How the runtime detects architecture">
+  At load time, `detect_target_family()` in `runtime.py` inspects the target model's layers for `linear_attn` or `is_linear` attributes. If any layer has these, the model is classified as `"hybrid_gdn"` and the speculative hooks (tape recording, SDPA chunking) are installed. Otherwise it is classified as `"pure_attention"` and the hooks are skipped.
+</Accordion>
+
+## Compatibility requirements
+
+To use a model with dflash-mlx:
+
+1. A DFlash draft model must exist on HuggingFace (either in the registry or provided via `--draft`).
+2. The draft model must be a `dflash_qwen3` model type loadable by `DFlashDraftModel`.
+3. The target model must be loadable by `mlx_lm` (MLX-format weights).
+
+## Using an unsupported model
+
+If your target model is not in the built-in registry, pass a compatible DFlash draft explicitly:
+
+```bash
+dflash --model your-org/your-model \
+       --draft z-lab/compatible-draft \
+       --prompt "Your prompt here"
+```
+
+The same flag works with `dflash-serve`:
+
+```bash
+dflash-serve --model your-org/your-model \
+             --draft z-lab/compatible-draft \
+             --port 8000
+```
+
+<Warning>
+  Models without a matching DFlash draft will be rejected at startup. If no `--draft` flag is provided and no registry entry is found for your target model, the runtime raises a `ValueError` listing supported base models and pointing to `https://huggingface.co/z-lab` for available drafts.
+</Warning>

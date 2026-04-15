@@ -1,0 +1,198 @@
+---
+title: "Tape-Replay Rollback for Recurrent State"
+description: "How dflash-mlx records an innovation tape during verify, then replays only accepted steps via a Metal kernel to roll back GatedDeltaNet state cheaply."
+---
+
+Speculative decoding with hybrid architectures presents a rollback challenge that pure-attention models do not face. When a block of draft tokens is partially accepted, the model's internal state must be wound back to reflect only the accepted prefix — but for recurrent layers like GatedDeltaNet, that state is a dense matrix that was mutated during the verify pass. dflash-mlx solves this with a tape-replay mechanism: instead of snapshotting and restoring the entire recurrent state, it records a compact innovation tape during verify and replays only the accepted steps through a custom Metal kernel.
+
+## The rollback problem in hybrid models
+
+Qwen3.5 models interleave standard KV-cache attention layers with GatedDeltaNet linear-attention layers. The two types have fundamentally different state structures:
+
+<CardGroup cols={2}>
+  <Card title="KV-cache attention layers" icon="database">
+    State is a key-value pair appended to at each step. Rolling back is trivial: trim the cache to the accepted length with `cache.trim(offset - target_len)`.
+  </Card>
+  <Card title="GatedDeltaNet recurrent layers" icon="arrows-rotate">
+    State is a dense `[B, Hv, Dv, Dk]` matrix updated by a gated delta rule at every token position. There is no direct index to "trim" — the state must be recomputed.
+  </Card>
+</CardGroup>
+
+A naive approach — snapshotting the full recurrent matrix before each verify pass and restoring it on partial acceptance — would move `O(Hv × Dv × Dk)` bytes per layer on every speculative cycle, and restoration cost would grow with model depth.
+
+## `RecurrentRollbackCache`: recording the innovation tape
+
+`RecurrentRollbackCache` (`recurrent_rollback_cache.py:15`) is the cache object used for GatedDeltaNet layers. It extends `_BaseCache` with three speculative-decoding methods: `arm_rollback`, `record_tape`, and `rollback`.
+
+### `arm_rollback()`
+
+Called before each verify pass (`runtime.py:826`). It sets the `_armed` flag and snapshots only the pre-verify state:
+
+```python
+def arm_rollback(self, prefix_len: int = 0) -> None:
+    del prefix_len
+    self._armed = True
+    self._tape = None
+    self._tape_k = None
+    self._tape_g = None
+    self._tape_qkv = None
+    self.checkpoint()
+```
+
+`checkpoint()` saves `list(self.cache)` — the current `[conv_state, recurrent_state]` pair — into `self._snapshot`. This is a reference copy, not a deep clone, so it is cheap.
+
+### `record_tape()`
+
+During the verify forward pass, the patched GatedDeltaNet `__call__` in `runtime.py` calls `gated_delta_kernel_with_tape`, which returns the output, the updated state, *and* the per-step innovation values. These are stored by `record_tape`:
+
+```python
+def record_tape(
+    self,
+    *,
+    tape: mx.array,
+    k: mx.array,
+    g: mx.array,
+    qkv: mx.array,
+) -> None:
+    self._tape = mx.contiguous(tape)
+    self._tape_k = mx.contiguous(k)
+    self._tape_g = mx.contiguous(g)
+    self._tape_qkv = mx.contiguous(qkv)
+```
+
+The tape `[B, T, Hv, Dv]` records the delta (innovation) value at each of the `T` verify positions. Keys `k` and gating values `g` are stored alongside so the replay kernel can reconstruct the state update without rerunning the full attention computation.
+
+### `rollback(n_accepted)`
+
+After acceptance is computed, `rollback` restores the pre-verify snapshot and then *forwards* the recurrent state by exactly `n_accepted + 1` steps using the stored tape:
+
+```python
+def rollback(self, n_accepted: int) -> None:
+    if self._snapshot is None:
+        return
+
+    self.cache = list(self._snapshot)
+    if (
+        self._tape is not None
+        and self._tape_k is not None
+        and self._tape_g is not None
+        and self.cache[1] is not None
+    ):
+        accepted_steps = int(n_accepted) + 1
+        state = tape_replay_kernel(
+            self._tape[:, :accepted_steps],
+            self._tape_k[:, :accepted_steps],
+            self._tape_g[:, :accepted_steps],
+            self.cache[1],
+            None,
+        )
+        self.cache[1] = state
+        self.cache[0] = self._rebuild_conv_state(accepted_steps)
+
+    self._armed = False
+    self._tape = None
+    ...
+```
+
+The `+1` accounts for the `staged_first` token at position 0, which is always accepted.
+
+## The tape-replay kernel
+
+`tape_replay_kernel` (`kernels.py:361`) is a custom Metal kernel that replays the GatedDeltaNet update rule over only the accepted steps, starting from the pre-verify snapshot state:
+
+```python
+def tape_replay_kernel(
+    tape: mx.array,   # [B, accepted_steps, Hv, Dv]
+    k: mx.array,      # [B, accepted_steps, Hk, Dk]
+    g: mx.array,      # [B, accepted_steps, Hv] or [B, accepted_steps, Hv, Dk]
+    state: mx.array,  # [B, Hv, Dv, Dk]  — pre-verify snapshot
+    mask: Optional[mx.array] = None,
+) -> mx.array:        # [B, Hv, Dv, Dk]  — post-accepted state
+```
+
+The Metal source applies, for each accepted step `t`:
+
+```
+state = state * g[t]          # gated decay
+state = state + k[t] * tape[t]  # delta update from tape
+state = round-trip cast to bf16  # match dtype of live kernel
+```
+
+This is equivalent to rerunning the GatedDeltaNet forward for those positions, but skips recomputing Q, K, V projections and the output projection — all of which are not needed to reconstruct the state. The kernel falls back to a pure-MLX Python path (`_tape_replay_ops`) when Metal is unavailable or when `Dk < 32`.
+
+## Rebuilding conv state: `_rebuild_conv_state`
+
+GatedDeltaNet also maintains a short convolutional state (`cache[0]`) of shape `[B, conv_kernel_size - 1, conv_dim]`. This cannot be replayed from the innovation tape, so `_rebuild_conv_state` reconstructs it from the stored raw QKV inputs:
+
+```python
+def _rebuild_conv_state(self, accepted_steps: int) -> mx.array | None:
+    if self._tape_qkv is None:
+        return self.cache[0]
+    keep = self.conv_kernel_size - 1
+    if keep <= 0:
+        return None
+    conv_state = self._snapshot[0] if self._snapshot is not None else None
+    if conv_state is None:
+        prefix = mx.zeros(
+            (self._tape_qkv.shape[0], keep, self._tape_qkv.shape[-1]),
+            dtype=self._tape_qkv.dtype,
+        )
+    else:
+        prefix = conv_state
+    conv_input = mx.concatenate([prefix, self._tape_qkv], axis=1)
+    start = accepted_steps
+    end = min(start + keep, int(conv_input.shape[1]))
+    return mx.contiguous(conv_input[:, start:end, :])
+```
+
+It prepends the pre-verify conv snapshot to the raw QKV tape, then slices the window at `[accepted_steps : accepted_steps + keep]` — exactly the `keep`-length suffix of inputs that feed into the next convolution.
+
+## Contrast with naive snapshot/restore
+
+<Accordion title="Why not just snapshot the full state?">
+  A full snapshot of one GatedDeltaNet layer's recurrent state for Qwen3.5-9B is roughly `B × Hv × Dv × Dk` elements in bf16. Across all recurrent layers, this is tens of megabytes per speculative cycle. More importantly, a full restore discards all accepted state progress and forces the recurrent state to recompute the accepted prefix in the *next* verify pass — introducing an asymmetry where early positions are computed twice.
+
+  Tape-replay costs `O(accepted_steps × Hv × Dv × Dk / 32)` operations on the GPU, proportional only to the accepted prefix length. For the typical 87–89% acceptance rate at 16 tokens per block, this is roughly 14 steps of very cheap Metal kernel work per layer.
+</Accordion>
+
+## When rollback is skipped
+
+If the entire drafted block is accepted (`acceptance_length == drafted_tokens`), the runtime calls `_clear_rollback_state` instead of `rollback`:
+
+```python
+fully_accepted = drafted_tokens > 0 and acceptance_length == drafted_tokens
+for cache_entry in cache_entries:
+    if hasattr(cache_entry, "rollback"):
+        if fully_accepted:
+            _clear_rollback_state(cache_entry)
+            continue
+        cache_entry.rollback(acceptance_length)
+```
+
+Full acceptance means the post-verify state is already correct — no replay is needed. `_clear_rollback_state` just clears the tape references without touching `cache[1]`.
+
+## Usage example
+
+`RecurrentRollbackCache` is constructed automatically by `make_target_cache` when `enable_speculative_linear_cache=True`:
+
+```python
+from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
+
+# Inside make_target_cache (runtime.py):
+conv_kernel_size = int(getattr(layer.linear_attn, "conv_kernel_size", 4))
+cache = RecurrentRollbackCache(size=2, conv_kernel_size=conv_kernel_size)
+
+# Before each verify pass:
+cache.arm_rollback(prefix_len=current_context_length)
+
+# During verify (inside speculative_call hook):
+out, state, innovation_tape = gated_delta_kernel_with_tape(q, k, v, g, beta, state, mask)
+cache.record_tape(tape=innovation_tape, k=k, g=g, qkv=qkv)
+
+# After acceptance is computed:
+cache.rollback(n_accepted=acceptance_len)
+```
+
+<Note>
+  `RecurrentRollbackCache` is only created for GatedDeltaNet layers (those where `layer.is_linear` is `True`). Pure-attention layers use standard `KVCache` or `QuantizedKVCache` objects, which support rollback via `trim`.
+</Note>

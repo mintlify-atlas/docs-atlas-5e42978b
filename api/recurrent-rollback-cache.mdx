@@ -1,0 +1,240 @@
+---
+title: 'RecurrentRollbackCache — Speculative SSM Cache'
+description: 'A KV cache for GatedDeltaNet linear attention layers that supports checkpoint-and-rollback for DFlash speculative decoding cycles.'
+---
+
+`RecurrentRollbackCache` is a stateful cache for GatedDeltaNet (GDN) linear attention layers in hybrid SSM/attention models. Standard KV caches hold a growing key-value matrix that can be trimmed by discarding tail entries. Linear attention layers instead maintain a fixed-size recurrent state that cannot be trivially rewound. `RecurrentRollbackCache` solves this by snapshotting the recurrent state before each speculative cycle and replaying only the accepted innovation steps on rejection, so that the cache ends up in exactly the same state as if only the accepted tokens had been processed.
+
+<Note>
+  `RecurrentRollbackCache` is created and managed automatically by `make_target_cache` and `stream_dflash_generate`. You do not need to instantiate or call it directly for typical generation use cases.
+</Note>
+
+---
+
+## Class signature
+
+```python
+class RecurrentRollbackCache(size: int, *, conv_kernel_size: int = 4)
+```
+
+Inherits from `mlx_lm.models.cache._BaseCache`.
+
+### Constructor parameters
+
+<ParamField path="size" type="int" required>
+  Number of cache slots. For GatedDeltaNet layers this is always `2`: slot `0` holds the convolution state (a tensor of shape `[B, conv_kernel_size - 1, conv_dim]`) and slot `1` holds the recurrent hidden state (shape `[B, num_v_heads, head_v_dim, head_k_dim]`).
+</ParamField>
+
+<ParamField path="conv_kernel_size" type="int" default="4">
+  Convolution kernel size of the associated `GatedDeltaNet` layer. Used to reconstruct the convolution sliding-window state during rollback. Must match `layer.linear_attn.conv_kernel_size`.
+</ParamField>
+
+---
+
+## Methods
+
+### `arm_rollback()`
+
+Prepare the cache for a new speculative cycle. Takes a snapshot of the current cache state and clears any recorded tape from a previous cycle. Must be called before the draft block is passed through the target model.
+
+```python
+cache.arm_rollback(prefix_len=start)
+```
+
+<ParamField path="prefix_len" type="int" default="0">
+  The token position at which the speculative window begins. Accepted by the signature for interface compatibility but not used internally — the snapshot always captures the full current state.
+</ParamField>
+
+Sets `_armed = True` and calls `checkpoint()` internally.
+
+---
+
+### `record_tape()`
+
+Record the innovation tensors produced during a GatedDeltaNet speculative forward pass. Called automatically by the patched `__call__` hook installed on `GatedDeltaNet` layers when the cache is armed.
+
+```python
+cache.record_tape(tape=innovation_tape, k=k, g=g, qkv=qkv)
+```
+
+<ParamField path="tape" type="mx.array" required>
+  Innovation tensor computed by the kernel, shape `[B, S, num_v_heads, head_v_dim]`. Represents the net update contributed by each token step.
+</ParamField>
+
+<ParamField path="k" type="mx.array" required>
+  Normalised key tensor from the forward pass, shape `[B, S, num_k_heads, head_k_dim]`.
+</ParamField>
+
+<ParamField path="g" type="mx.array" required>
+  Decay gate values from the forward pass.
+</ParamField>
+
+<ParamField path="qkv" type="mx.array" required>
+  Combined QKV projection output before convolution, shape `[B, S, conv_dim]`. Used to reconstruct the convolution window state after rollback.
+</ParamField>
+
+All four tensors are stored as contiguous arrays via `mx.contiguous`.
+
+---
+
+### `rollback()`
+
+Replay the recorded innovation tape for the accepted prefix and discard all rejected state. After `rollback` returns, the cache reflects exactly the state that would result from processing only the accepted tokens starting from the pre-cycle snapshot.
+
+```python
+cache.rollback(n_accepted=acceptance_len)
+```
+
+<ParamField path="n_accepted" type="int" required>
+  Number of draft tokens that were accepted by the target. The speculative cycle always commits at least one additional token (the target's own prediction at position 0 of the block), so the tape is replayed for `n_accepted + 1` steps.
+</ParamField>
+
+**Rollback procedure:**
+
+1. Restore `cache[0]` and `cache[1]` from `_snapshot`.
+2. If a tape was recorded, call `tape_replay_kernel` on the first `n_accepted + 1` innovation steps to advance the recurrent state to the correct post-acceptance position.
+3. Reconstruct the convolution sliding-window state from `_tape_qkv` at offset `n_accepted + 1`.
+4. Clear `_armed`, `_tape`, `_tape_k`, `_tape_g`, and `_tape_qkv`.
+
+<Warning>
+  Calling `rollback` without a prior `arm_rollback` call is safe — the method returns immediately when `_snapshot` is `None`.
+</Warning>
+
+---
+
+### `checkpoint()`
+
+Save the current cache slot values as a snapshot. Called automatically by `arm_rollback`. You can call it manually to create an explicit save point before non-speculative forward passes.
+
+```python
+cache.checkpoint()
+```
+
+Stores a shallow copy of `self.cache` in `self._snapshot`.
+
+---
+
+### `empty()`
+
+Return `True` when no state has been written to the cache (slot `0` is still `None`).
+
+```python
+if cache.empty():
+    print("Cache not yet populated.")
+```
+
+### Returns
+
+<ResponseField name="is_empty" type="bool">
+  `True` when `self.cache[0] is None`, `False` otherwise.
+</ResponseField>
+
+---
+
+### `make_mask()`
+
+Create an attention mask array for SSM layers based on sequence padding state. Returns `None` when no padding information is set (the common case during autoregressive generation).
+
+```python
+mask = cache.make_mask(n=seq_len)
+```
+
+<ParamField path="n" type="int" required>
+  Sequence length to create the mask for.
+</ParamField>
+
+### Returns
+
+<ResponseField name="mask" type="Optional[mx.array]">
+  A boolean array of shape `[batch, n]` when `left_padding` or `lengths` is set, or `None` when neither is present.
+</ResponseField>
+
+---
+
+## `nbytes` property
+
+Total size in bytes of all non-`None` cache slot arrays. Useful for memory accounting.
+
+```python
+print(f"Cache size: {cache.nbytes / 1024:.1f} KB")
+```
+
+### Returns
+
+<ResponseField name="nbytes" type="int">
+  Sum of `.nbytes` for every non-`None` element in `self.cache`.
+</ResponseField>
+
+---
+
+## Internal fields
+
+These attributes are set during speculative cycles and are not part of the public API, but are documented here for contributors.
+
+| Field | Type | Description |
+|---|---|---|
+| `_armed` | `bool` | `True` while a speculative cycle is in progress. Controls whether the patched GDN `__call__` records tape. |
+| `_tape` | `Optional[mx.array]` | Innovation tape recorded during the current cycle. |
+| `_tape_k` | `Optional[mx.array]` | Key tensor tape recorded during the current cycle. |
+| `_tape_g` | `Optional[mx.array]` | Decay gate tape recorded during the current cycle. |
+| `_tape_qkv` | `Optional[mx.array]` | Raw QKV convolution input recorded during the current cycle. Used to rebuild the conv state. |
+| `_snapshot` | `Optional[list]` | Shallow copy of `self.cache` taken at `arm_rollback` time. |
+
+---
+
+## How `make_target_cache()` creates this cache
+
+`make_target_cache` in `dflash_mlx.runtime` iterates over each layer of the target model. When it encounters a layer with `is_linear=True` and a `linear_attn` attribute, it reads `layer.linear_attn.conv_kernel_size` and creates a `RecurrentRollbackCache` with `size=2`:
+
+```python
+from dflash_mlx.runtime import make_target_cache
+from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
+
+# Equivalent to what make_target_cache does internally for each linear layer:
+conv_kernel_size = int(getattr(layer.linear_attn, "conv_kernel_size", 4))
+cache_for_layer = RecurrentRollbackCache(size=2, conv_kernel_size=conv_kernel_size)
+```
+
+Full-attention layers in the same model receive a standard `KVCache` or `QuantizedKVCache` instead. The resulting list is indexed by layer position and passed to the target model's forward function.
+
+---
+
+## Usage example
+
+The following sketch shows the speculative loop at the level where `RecurrentRollbackCache` is visible. In practice this is handled entirely by `stream_dflash_generate`.
+
+```python
+from dflash_mlx.runtime import make_target_cache
+from dflash_mlx.recurrent_rollback_cache import RecurrentRollbackCache
+
+target_cache = make_target_cache(
+    target_model,
+    enable_speculative_linear_cache=True,
+)
+
+# --- speculative cycle ---
+
+# 1. Arm rollback on every linear-layer cache before the verify forward pass.
+for c in target_cache:
+    if isinstance(c, RecurrentRollbackCache):
+        c.arm_rollback(prefix_len=current_position)
+
+# 2. Run the verify forward pass. The patched GDN __call__ records tape
+#    automatically when _armed is True.
+verify_logits, _ = target_forward_with_hidden_states(
+    target_model, input_ids=block_ids, cache=target_cache
+)
+
+# 3. Compute how many draft tokens were accepted.
+acceptance_len = compute_acceptance(verify_logits, drafted_tokens)
+
+# 4. Roll back each linear cache to the accepted prefix.
+for c in target_cache:
+    if isinstance(c, RecurrentRollbackCache):
+        c.rollback(n_accepted=acceptance_len)
+
+# 5. Trim standard KV caches to the accepted length.
+for c in target_cache:
+    if hasattr(c, "trim") and not isinstance(c, RecurrentRollbackCache):
+        c.trim(...)
+```

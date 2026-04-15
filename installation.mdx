@@ -1,0 +1,110 @@
+---
+title: "Install dflash-mlx on Apple Silicon — Requirements & Setup"
+description: "Step-by-step guide to installing dflash-mlx with pip or pipx on an Apple Silicon Mac, covering Python, MLX, and mlx-lm version requirements."
+---
+
+dflash-mlx is distributed as a standard Python package and installs in a single command. This page covers the hardware and software requirements, the two recommended installation methods, and how to verify that the CLI tools are available before you run your first generation.
+
+## Requirements
+
+Before installing, confirm your environment meets the following requirements:
+
+| Requirement | Minimum version |
+|-------------|----------------|
+| Hardware | Apple Silicon Mac (M1 or later) |
+| Python | 3.10+ |
+| MLX | 0.25.0+ |
+| mlx-lm | 0.31.0+ |
+
+<Note>
+  dflash-mlx uses custom Metal kernels for tape-replay rollback and long-context attention. These kernels require Apple's Metal GPU and will not run on Intel Macs or non-Apple hardware.
+</Note>
+
+## Install
+
+<Steps>
+  <Step title="Install dflash-mlx">
+    Choose pip for a standard virtual environment install, or pipx to install into an isolated environment and expose the CLI tools globally.
+
+    <CodeGroup>
+      ```bash pip
+      pip install dflash-mlx
+      ```
+
+      ```bash pipx
+      pipx install dflash-mlx
+      ```
+    </CodeGroup>
+
+    Both commands install three CLI entry points: `dflash`, `dflash-serve`, and `dflash-benchmark`. The pip install also makes the `dflash_mlx` Python package importable in your environment.
+  </Step>
+
+  <Step title="Verify the installation">
+    Confirm that the CLI is available and the entry points resolve correctly:
+
+    ```bash
+    dflash --help
+    ```
+
+    You should see output similar to:
+
+    ```
+    usage: dflash [-h] --model MODEL --prompt PROMPT [--max-tokens MAX_TOKENS]
+                  [--no-chat-template] [--draft DRAFT]
+
+    Generate text with DFlash on MLX.
+
+    options:
+      -h, --help            show this help message and exit
+      --model MODEL         Target model reference.
+      --prompt PROMPT       Prompt to generate from.
+      --max-tokens MAX_TOKENS
+      --no-chat-template
+      --draft DRAFT         Optional draft model override.
+    ```
+
+    Run the same check for the server and benchmark commands:
+
+    ```bash
+    dflash-serve --help
+    dflash-benchmark --help
+    ```
+  </Step>
+
+  <Step title="Confirm draft model auto-download">
+    Draft models are downloaded automatically from HuggingFace on first use — no manual download step is required. When you run `dflash --model Qwen/Qwen3.5-9B ...`, the runtime:
+
+    1. Looks up `Qwen3.5-9B` in the built-in draft registry.
+    2. Resolves the matching draft (`z-lab/Qwen3.5-9B-DFlash`).
+    3. Downloads both the target and draft model weights via `huggingface_hub` if they are not already cached locally.
+
+    Subsequent runs reuse the cached weights. You can also pass a local path to `--model` or `--draft` to bypass the download entirely.
+
+    <Note>
+      Models are cached in the default HuggingFace cache directory (`~/.cache/huggingface/hub`). Ensure you have sufficient disk space — a 9B model in bf16 requires roughly 18 GB, and a 1B draft model adds approximately 2 GB.
+    </Note>
+  </Step>
+</Steps>
+
+## Supported models
+
+The following target–draft pairs are registered and auto-resolved:
+
+| Target model | Auto-resolved draft |
+|---|---|
+| `Qwen/Qwen3.5-4B` | `z-lab/Qwen3.5-4B-DFlash` |
+| `Qwen/Qwen3.5-9B` | `z-lab/Qwen3.5-9B-DFlash` |
+| `mlx-community/Qwen3.5-27B-4bit` | `z-lab/Qwen3.5-27B-DFlash` |
+| `mlx-community/Qwen3.5-35B-A3B-4bit` | `z-lab/Qwen3.5-35B-A3B-DFlash` |
+
+Any HuggingFace model with a compatible DFlash draft should work. Pass `--draft <repo>` explicitly to use a draft that is not in the built-in registry.
+
+<Warning>
+  Models without a matching DFlash draft are rejected at startup. If you see an error like `No DFlash draft model found for '...'`, either pass `--draft` explicitly or check [huggingface.co/z-lab](https://huggingface.co/z-lab) for an available draft.
+</Warning>
+
+## Next steps
+
+<Card title="Quickstart" icon="play" href="/quickstart">
+  Run your first generation, start the OpenAI-compatible server, and connect a client.
+</Card>

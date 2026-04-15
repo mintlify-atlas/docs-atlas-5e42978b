@@ -1,0 +1,271 @@
+---
+title: 'dflash_mlx.generate — High-Level Generation Helpers'
+description: 'Resolve draft model refs, load runtime components, decode tokens, compute throughput, and run end-to-end generation with a single function call.'
+---
+
+The `dflash_mlx.generate` module builds a thin, user-facing layer on top of `dflash_mlx.runtime`. It provides a draft model registry for supported Qwen target models, helper functions for resolving references, decoding token IDs to text, and computing generation throughput from a summary event. The `run_generate` function ties everything together into a single call suitable for scripts and CLI tools.
+
+---
+
+## `DRAFT_REGISTRY`
+
+A mapping from canonical model name strings to their corresponding DFlash draft model Hugging Face repo IDs.
+
+```python
+from dflash_mlx.generate import DRAFT_REGISTRY
+
+print(DRAFT_REGISTRY)
+# {
+#   "Qwen3.5-4B":      "z-lab/Qwen3.5-4B-DFlash",
+#   "Qwen3.5-9B":      "z-lab/Qwen3.5-9B-DFlash",
+#   "Qwen3.5-27B":     "z-lab/Qwen3.5-27B-DFlash",
+#   "Qwen3.5-35B-A3B": "z-lab/Qwen3.5-35B-A3B-DFlash",
+#   "Qwen3-4B":        "z-lab/Qwen3-4B-DFlash-b16",
+#   "Qwen3-8B":        "z-lab/Qwen3-8B-DFlash-b16",
+# }
+```
+
+**Type:** `dict[str, str]`
+
+`resolve_optional_draft_ref` uses a normalised (lowercase) copy of this registry for case-insensitive model name matching. Add entries to `DRAFT_REGISTRY` to register additional draft models without modifying any other code.
+
+---
+
+## `resolve_optional_draft_ref()`
+
+Look up the draft model repo ID for a given target model reference. Returns `None` when no matching entry is found, allowing callers to raise a descriptive error or prompt the user for a manual override.
+
+```python
+from dflash_mlx.generate import resolve_optional_draft_ref
+
+draft_ref = resolve_optional_draft_ref(
+    "mlx-community/Qwen3-8B-4bit",
+    draft_ref=None,
+)
+print(draft_ref)  # "z-lab/Qwen3-8B-DFlash-b16"
+
+# Pass an explicit override to skip registry lookup
+draft_ref = resolve_optional_draft_ref(
+    "mlx-community/Qwen3-8B-4bit",
+    draft_ref="my-org/custom-draft",
+)
+print(draft_ref)  # "my-org/custom-draft"
+```
+
+### Parameters
+
+<ParamField path="model_ref" type="str" required>
+  Target model reference string (local path or Hugging Face repo ID). The organisation prefix (e.g. `mlx-community/`) is stripped before registry lookup.
+</ParamField>
+
+<ParamField path="draft_ref" type="Optional[str]">
+  Explicit draft model reference. When truthy, this value is returned immediately without consulting the registry. Pass `None` to trigger automatic registry lookup.
+</ParamField>
+
+### Returns
+
+<ResponseField name="draft_ref" type="Optional[str]">
+  The resolved draft model repo ID string, or `None` if no match was found in `DRAFT_REGISTRY` and no explicit override was provided.
+</ResponseField>
+
+**Matching behaviour:** the function strips the org prefix from `model_ref`, lowercases the result, then performs an exact match and prefix match against the normalised registry keys. The longest matching key wins.
+
+---
+
+## `load_runtime_components()`
+
+Load the target model, tokenizer, and draft model in a single call. Calls `resolve_optional_draft_ref` internally and raises `ValueError` with a descriptive message when no draft can be resolved.
+
+```python
+from dflash_mlx.generate import load_runtime_components
+
+target_model, tokenizer, draft_model, resolved_draft_ref = load_runtime_components(
+    model_ref="mlx-community/Qwen3-8B-4bit",
+    draft_ref=None,
+)
+print(resolved_draft_ref)  # "z-lab/Qwen3-8B-DFlash-b16"
+```
+
+### Parameters
+
+<ParamField path="model_ref" type="str" required>
+  Target model reference passed to `load_target_bundle`.
+</ParamField>
+
+<ParamField path="draft_ref" type="Optional[str]" required>
+  Optional explicit draft model reference. `None` triggers automatic registry lookup.
+</ParamField>
+
+### Returns
+
+A 4-tuple `(target_model, tokenizer, draft_model, resolved_draft_ref)`.
+
+<ResponseField name="target_model" type="Any">
+  Target model with speculative hooks installed, as returned by `load_target_bundle`.
+</ResponseField>
+
+<ResponseField name="tokenizer" type="Any">
+  Tokenizer for the target model.
+</ResponseField>
+
+<ResponseField name="draft_model" type="DFlashDraftModel">
+  Draft model, as returned by `load_draft_bundle`.
+</ResponseField>
+
+<ResponseField name="resolved_draft_ref" type="str">
+  The draft model reference that was actually loaded.
+</ResponseField>
+
+---
+
+## `get_stop_token_ids()`
+
+Extract EOS token IDs from a tokenizer. Collects both `eos_token_id` (single integer) and `eos_token_ids` (list) attributes, deduplicates, and returns them as a plain list suitable for passing to `stop_token_ids` in `stream_dflash_generate`.
+
+```python
+from dflash_mlx.generate import get_stop_token_ids
+
+stop_ids = get_stop_token_ids(tokenizer)
+print(stop_ids)  # e.g. [151645, 151643]
+```
+
+### Parameters
+
+<ParamField path="tokenizer" type="Any" required>
+  A tokenizer object with `eos_token_id` and/or `eos_token_ids` attributes. Compatible with any `mlx-lm` tokenizer.
+</ParamField>
+
+### Returns
+
+<ResponseField name="stop_token_ids" type="list[int]">
+  Deduplicated list of EOS token IDs. Returns an empty list when neither attribute is present.
+</ResponseField>
+
+---
+
+## `decode_token()`
+
+Decode a single integer token ID to its string representation. Handles tokenizers that require a list argument and those that accept a scalar, falling back gracefully.
+
+```python
+from dflash_mlx.generate import decode_token
+
+text = decode_token(tokenizer, 151644)
+print(repr(text))  # e.g. " Hello"
+```
+
+### Parameters
+
+<ParamField path="tokenizer" type="Any" required>
+  A tokenizer with a `decode` method.
+</ParamField>
+
+<ParamField path="token_id" type="int" required>
+  Integer token ID to decode.
+</ParamField>
+
+### Returns
+
+<ResponseField name="text" type="str">
+  The decoded string for the given token. May include leading whitespace depending on the tokenizer's behaviour.
+</ResponseField>
+
+---
+
+## `generation_tps_from_summary()`
+
+Compute generation throughput in tokens per second from a `"summary"` event dict. Prefill time is subtracted from elapsed time so that the result reflects decoding speed only.
+
+```python
+from dflash_mlx.generate import generation_tps_from_summary
+
+for event in stream:
+    if event["event"] == "summary":
+        tps = generation_tps_from_summary(event)
+        print(f"{tps:.1f} tok/s")
+```
+
+### Parameters
+
+<ParamField path="summary" type="dict[str, Any]" required>
+  A `"summary"` event dictionary as yielded by `stream_dflash_generate`. Must contain `elapsed_us` and `generation_tokens`. Optionally contains `prefill_us` or `phase_timings_us.prefill` for prefill subtraction.
+</ParamField>
+
+### Returns
+
+<ResponseField name="tps" type="float">
+  Generation throughput in tokens per second, computed as `generation_tokens / (generation_us / 1e6)`. Returns `0.0` when generation time is zero.
+</ResponseField>
+
+---
+
+## `run_generate()`
+
+End-to-end generation function that loads models, streams tokens to stdout, and prints a performance summary to stderr. Returns an integer exit code suitable for `SystemExit`. This is the function called by the `dflash` CLI entry point.
+
+```python
+from dflash_mlx.generate import run_generate
+import sys
+
+exit_code = run_generate(
+    model_ref="mlx-community/Qwen3-8B-4bit",
+    prompt="Summarise the attention mechanism.",
+    max_tokens=512,
+    use_chat_template=True,
+    draft_ref=None,
+)
+sys.exit(exit_code)
+```
+
+### Parameters
+
+<ParamField path="model_ref" type="str" required>
+  Target model reference passed to `load_runtime_components`.
+</ParamField>
+
+<ParamField path="prompt" type="str" required>
+  Input text prompt.
+</ParamField>
+
+<ParamField path="max_tokens" type="int" required>
+  Maximum number of tokens to generate.
+</ParamField>
+
+<ParamField path="use_chat_template" type="bool" required>
+  Apply the tokenizer's chat template to the prompt.
+</ParamField>
+
+<ParamField path="draft_ref" type="Optional[str]" required>
+  Optional explicit draft model reference. `None` triggers automatic lookup.
+</ParamField>
+
+### Returns
+
+<ResponseField name="exit_code" type="int">
+  `0` on successful completion. `1` if no summary event was received (generation failed).
+</ResponseField>
+
+<Tip>
+  Tokens are written to `sys.stdout` as they arrive. The final performance line (`N tokens | X tok/s | Y% acceptance`) is written to `sys.stderr` so that it does not pollute piped output.
+</Tip>
+
+---
+
+## CLI usage
+
+The module exposes a `main()` entry point that wraps `run_generate` via `argparse`. Install the package and run:
+
+```bash
+python -m dflash_mlx.generate \
+  --model mlx-community/Qwen3-8B-4bit \
+  --prompt "Explain Flash Attention." \
+  --max-tokens 256
+```
+
+| Flag | Description |
+|---|---|
+| `--model` | Target model reference (required). |
+| `--prompt` | Input prompt string (required). |
+| `--max-tokens` | Token budget (default `2048`). |
+| `--no-chat-template` | Disable chat template application. |
+| `--draft` | Override draft model reference. |

@@ -1,0 +1,102 @@
+---
+title: "DFlash MLX: Speculative Decoding for Apple Silicon"
+description: "Learn how dflash-mlx uses block-diffusion speculative decoding to deliver up to 4x faster, lossless text generation on Apple Silicon with the MLX framework."
+---
+
+dflash-mlx brings DFlash speculative decoding to Apple Silicon, delivering up to **4.13x faster** text generation without sacrificing output quality. This page explains the core concepts behind the library — what DFlash is, why it targets Apple Silicon, what "lossless" guarantees mean in practice, and how it performs across different model sizes.
+
+## What is DFlash speculative decoding?
+
+Standard autoregressive generation produces one token per forward pass, leaving the GPU mostly idle between steps. Speculative decoding changes this by running a small, fast *draft model* to generate a candidate block of tokens, then letting the larger *target model* verify the entire block in a single parallel forward pass.
+
+DFlash (introduced in [Chen et al., 2026](https://arxiv.org/abs/2602.06036)) extends this idea with **block diffusion**: instead of drafting tokens one at a time, the draft model generates all 16 tokens in a block simultaneously using a diffusion process. This reduces draft latency and keeps the target model's verification pipeline saturated.
+
+- A ~1B-parameter draft model generates 16 tokens in parallel via block diffusion.
+- The target model verifies all 16 in a single forward pass using greedy acceptance.
+- Accepted tokens are committed; rejected tokens are rolled back and generation continues.
+
+## Why Apple Silicon and MLX?
+
+Apple Silicon's unified memory architecture eliminates PCIe bandwidth bottlenecks between CPU and GPU memory, making it unusually well-suited for the tight draft-verify loop that speculative decoding requires. The MLX framework exposes Apple's Metal GPU directly, allowing dflash-mlx to ship targeted Metal kernels for the two performance-critical paths:
+
+- **Tape-replay rollback** — instead of snapshotting and restoring full GatedDeltaNet recurrent state, dflash-mlx records an *innovation tape* during verify and replays only the accepted steps through a custom Metal kernel.
+- **JIT SDPA 2-pass** — long-context verify passes (sequence length ≥ 1024) use a custom Metal attention kernel that stays numerically aligned with stock MLX attention.
+
+Everything else runs on stock MLX; no custom training infrastructure or patched framework is required.
+
+## Lossless guarantee
+
+Every token emitted by dflash-mlx is the target model's greedy argmax at verification time. No unverified token is ever committed. This means dflash-mlx output is **semantically identical** to running the target model alone under greedy decoding — you get the speed of speculative decoding without any distribution shift. Minor token-level differences from pure autoregressive runs can occur due to MLX Metal dispatch floating-point divergence, but no unverified token is ever emitted.
+
+## Performance benchmarks
+
+Benchmarks were run on an Apple M5 Max with 64 GB unified memory using MLX 0.31.1. Each result is the median of 3 runs with a 10-second cooldown, measuring post-prefill tokens per second.
+
+| Model | Tokens | Baseline | DFlash | Speedup | Acceptance |
+|-------|--------|----------|--------|---------|------------|
+| Qwen3.5-4B | 1024 | 53.48 tok/s | 197.49 tok/s | **3.69x** | 88.67% |
+| Qwen3.5-4B | 2048 | 53.74 tok/s | 219.83 tok/s | **4.10x** | 89.26% |
+| Qwen3.5-4B | 4096 | 53.58 tok/s | 155.19 tok/s | **2.83x** | 87.55% |
+| Qwen3.5-9B | 1024 | 31.09 tok/s | 127.47 tok/s | **4.10x** | 88.96% |
+| Qwen3.5-9B | 2048 | 30.96 tok/s | 127.07 tok/s | **4.13x** | 89.36% |
+| Qwen3.5-9B | 4096 | 31.58 tok/s | 103.90 tok/s | **3.29x** | 88.57% |
+| Qwen3.5-27B-4bit | 1024 | 33.24 tok/s | 65.80 tok/s | **1.98x** | 89.45% |
+| Qwen3.5-27B-4bit | 2048 | 32.35 tok/s | 62.78 tok/s | **1.90x** | 89.11% |
+| Qwen3.5-27B-4bit | 4096 | 29.38 tok/s | 48.89 tok/s | **1.66x** | 87.99% |
+| Qwen3.5-35B-A3B-4bit | 1024 | 139.97 tok/s | 242.92 tok/s | **1.74x** | 89.26% |
+| Qwen3.5-35B-A3B-4bit | 2048 | 142.12 tok/s | 240.21 tok/s | **1.69x** | 88.67% |
+| Qwen3.5-35B-A3B-4bit | 4096 | 140.73 tok/s | 189.62 tok/s | **1.35x** | 86.96% |
+
+Acceptance rates consistently sit above 86% across all model sizes and generation lengths, which reflects how well the block-diffusion draft distribution tracks the target model.
+
+## Key features
+
+<CardGroup cols={2}>
+  <Card title="Auto draft resolution" icon="wand-magic-sparkles">
+    Pass only `--model` and dflash-mlx automatically selects the matching draft model from the built-in registry. No `--draft` flag needed for supported models.
+  </Card>
+  <Card title="Lossless output" icon="shield-check">
+    Every emitted token is verified by the target model before commit. The output distribution is identical to greedy autoregressive decoding.
+  </Card>
+  <Card title="OpenAI-compatible server" icon="server">
+    `dflash-serve` wraps `mlx_lm.server` with full streaming SSE, tool calling, and reasoning support while using the DFlash runtime as the generation engine.
+  </Card>
+  <Card title="Recurrent rollback" icon="rotate-left">
+    `RecurrentRollbackCache` keeps GatedDeltaNet recurrent state coherent across speculative verify and rollback cycles using tape replay, preserving acceptance at long context lengths.
+  </Card>
+  <Card title="Streaming output" icon="bolt">
+    Token-by-token streaming in both the CLI (`dflash`) and the server (`dflash-serve`), compatible with Open WebUI, Continue, aider, and other OpenAI clients.
+  </Card>
+  <Card title="Chat templates enabled" icon="message">
+    Chat templates are applied by default in both the CLI and server, with per-model template arguments (e.g. `enable_thinking`) exposed via `--chat-template-args`.
+  </Card>
+</CardGroup>
+
+## Next steps
+
+Ready to get started? Install the package and run your first generation in under two minutes.
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Install dflash-mlx with pip or pipx, verify requirements, and confirm the CLI is working.
+  </Card>
+  <Card title="Quickstart" icon="play" href="/quickstart">
+    Generate text, start an OpenAI-compatible server, connect a client, and run a benchmark.
+  </Card>
+</CardGroup>
+
+## Citation
+
+If you use dflash-mlx in research, please cite the underlying DFlash paper:
+
+```bibtex
+@misc{chen2026dflash,
+  title={DFlash: Block Diffusion for Flash Speculative Decoding},
+  author={Jian Chen and Yesheng Liang and Zhijian Liu},
+  year={2026},
+  eprint={2602.06036},
+  archivePrefix={arXiv},
+  primaryClass={cs.CL},
+  url={https://arxiv.org/abs/2602.06036}
+}
+```

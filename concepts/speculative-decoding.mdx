@@ -1,0 +1,134 @@
+---
+title: "Speculative Decoding with Block Diffusion"
+description: "Block diffusion drafts 16 tokens in a single pass; the target model verifies them in one forward pass. Every committed token is the target's greedy argmax."
+---
+
+Speculative decoding accelerates autoregressive language model inference by using a fast draft model to propose candidate tokens and a larger target model to verify them in a single parallel pass. dflash-mlx implements this pattern using block diffusion (from [DFlash, arXiv:2602.06036](https://arxiv.org/abs/2602.06036)), where a small ~1B-parameter draft model generates an entire block of 16 tokens simultaneously, rather than one token at a time. This page explains the full draft-verify loop, the greedy acceptance algorithm, and the conditions under which the runtime falls back to standard autoregressive decoding.
+
+## Standard speculative decoding
+
+In classic speculative decoding, a draft model proposes a sequence of tokens autoregressively, one per forward pass. The target model then runs a single forward pass over the entire proposed sequence and checks each token position for agreement. Positions where draft and target agree are accepted; the first mismatch is rejected and replaced by the target's prediction. This yields a net speedup because the target's single verification pass handles many tokens at once.
+
+The quality guarantee is that every emitted token is exactly what the target model's greedy argmax would have produced — the output is statistically identical to running the target alone.
+
+## DFlash block diffusion: 16 tokens per draft pass
+
+DFlash replaces the sequential draft with a block diffusion model. Instead of generating tokens one at a time, the draft model fills an entire block of `block_size=16` positions in a single forward pass.
+
+<Steps>
+  <Step title="Initialize the block buffer">
+    At the start of each cycle, a token buffer of length `block_size` is prepared. Position 0 is set to the `staged_first` token (the target's prediction from the previous cycle). Positions 1–15 are filled with the `mask_token_id` sentinel.
+
+    ```python
+    block_token_buffer[:block_len] = draft_model.mask_token_id
+    block_token_buffer[:1] = staged_first
+    block_token_ids = block_token_buffer[:block_len]
+    ```
+  </Step>
+  <Step title="Draft: one parallel forward pass">
+    The draft model (`DFlashDraftModel`) takes the noise embedding of the masked block plus a context feature extracted from target hidden states, and returns refined hidden states for all 16 positions simultaneously. The target's LM head is applied to positions 1–15 to produce draft logits.
+
+    ```python
+    noise_embedding = _target_embed_tokens(target_model)(block_token_ids[None])
+    draft_hidden = draft_model(
+        noise_embedding=noise_embedding,
+        target_hidden=target_hidden,
+        cache=draft_cache,
+    )
+    draft_logits = _lm_head_logits(target_model, draft_hidden[:, 1:, :])
+    drafted = greedy_tokens_with_mask(draft_logits, suppress_token_mask).squeeze(0)
+    block_token_ids[1:block_len] = drafted
+    ```
+  </Step>
+  <Step title="Verify: one target forward pass">
+    The entire block (`verify_ids`) is passed to the target model in a single forward pass. This produces `verify_logits` for every position — the target's posterior distribution at each step given all preceding tokens.
+
+    ```python
+    verify_logits, verify_hidden_states = _verify_target_block(
+        target_model=target_model,
+        verify_ids=verify_ids,
+        target_cache=target_cache,
+        verify_chunk_tokens=verify_chunk_tokens,
+        capture_layer_ids=capture_layer_ids,
+    )
+    ```
+  </Step>
+  <Step title="Accept: greedy matching">
+    Draft tokens are compared against the target's greedy argmax. The runtime commits the longest accepted prefix plus the first target correction.
+  </Step>
+</Steps>
+
+## Greedy acceptance: `_match_acceptance_length`
+
+The acceptance check is a cumulative-product scan over a boolean equality array (`runtime.py:113`):
+
+```python
+def _match_acceptance_length(
+    drafted_tokens: mx.array,
+    posterior_tokens: mx.array,
+) -> mx.array:
+    if int(drafted_tokens.shape[0]) == 0:
+        return mx.array(0, dtype=mx.int32)
+    matches = mx.equal(drafted_tokens, posterior_tokens).astype(mx.int32)
+    return mx.sum(mx.cumprod(matches, axis=0))
+```
+
+`cumprod` turns `[1, 1, 0, 1, ...]` into `[1, 1, 0, 0, ...]` — once a mismatch is hit, all subsequent positions are zeroed. Summing gives the length of the longest accepted prefix. This is called with:
+
+```python
+posterior = greedy_tokens_with_mask(verify_logits[0], suppress_token_mask)
+acceptance_len = int(
+    _match_acceptance_length(verify_token_ids[1:], posterior[:-1]).item()
+)
+```
+
+The token committed to output is `1 + acceptance_len`: the `staged_first` token that began the block (always accepted, since it was already produced by the target), plus any draft tokens the target confirmed.
+
+## Lossless guarantee
+
+Every token dflash-mlx emits is the target model's greedy argmax. The draft model only influences *which* tokens reach the target for verification — it never bypasses the target check. The one caveat noted in the source is MLX dispatch divergence: compute dispatch ordering on Apple Silicon can cause bf16 results to differ from a pure sequential run, but no *unverified* token is ever committed.
+
+## Why this is faster
+
+<CardGroup cols={2}>
+  <Card title="Parallelism in draft" icon="bolt">
+    Block diffusion generates all 16 positions in one pass. A sequential draft model would need 15 extra forward passes for the same block.
+  </Card>
+  <Card title="Parallelism in verify" icon="check">
+    The target verifies all 16 tokens in a single batched forward pass. Accepted tokens amortize that cost across multiple output positions.
+  </Card>
+  <Card title="High acceptance rate" icon="chart-line">
+    Benchmarks show 87–89% acceptance across 1K–4K token generations, meaning most draft tokens are confirmed and committed.
+  </Card>
+  <Card title="One target pass per cycle" icon="repeat">
+    Each speculative cycle issues exactly one draft pass and one verify pass, regardless of block size.
+  </Card>
+</CardGroup>
+
+### Measured performance (Apple M5 Max, MLX 0.31.1)
+
+| Model | Tokens | Baseline | DFlash | Speedup |
+|---|---|---|---|---|
+| Qwen3.5-4B | 1024 | 53.48 tok/s | 197.49 tok/s | **3.69×** |
+| Qwen3.5-9B | 2048 | 30.96 tok/s | 127.07 tok/s | **4.13×** |
+| Qwen3.5-27B-4bit | 1024 | 33.24 tok/s | 65.80 tok/s | **1.98×** |
+| Qwen3.5-35B-A3B-4bit | 1024 | 139.97 tok/s | 242.92 tok/s | **1.74×** |
+
+Speedup decreases at 4096 tokens as the KV cache grows and long-context verify cost increases. The `DFLASH_VERIFY_LEN` environment variable can cap the number of tokens forwarded to the target per cycle.
+
+## Fallback to autoregressive
+
+When the prompt length meets or exceeds `DFLASH_MAX_CTX` (default `4096`, settable via `--dflash-max-ctx`), the runtime falls back to standard autoregressive generation (`runtime.py:1113`):
+
+```python
+dflash_max_ctx = _resolve_dflash_max_ctx()
+if prompt_len >= dflash_max_ctx:
+    fallback_reason = f"prompt_len={prompt_len} >= DFLASH_MAX_CTX={dflash_max_ctx}"
+    baseline = generate_baseline_once(...)
+```
+
+Streaming output marks these events with `"fallback_ar": True` and a `fallback_reason` string so callers can observe when speculative decoding is not in effect.
+
+<Tip>
+  Raise the threshold for long-context workloads with `--dflash-max-ctx 16384` on the `dflash-serve` command. Keep in mind that very long contexts reduce acceptance rate and may reduce the net speedup.
+</Tip>

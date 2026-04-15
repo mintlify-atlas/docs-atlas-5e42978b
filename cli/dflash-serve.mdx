@@ -1,0 +1,157 @@
+---
+title: "dflash-serve CLI Reference — OpenAI-Compatible Server"
+description: "Serve any supported DFlash model over an OpenAI-compatible HTTP API with streaming, tool calling, and reasoning support on Apple Silicon."
+---
+
+`dflash-serve` wraps `mlx_lm.server` and replaces its generation engine with the DFlash speculative decoding runtime. The result is a fully OpenAI-compatible HTTP server — supporting streaming SSE, tool calling, and thinking/reasoning tokens — that generates at DFlash throughput instead of plain autoregressive speed.
+
+## Synopsis
+
+```bash
+dflash-serve --model <model-ref> [options]
+```
+
+## Flags
+
+### Model
+
+<ParamField path="--model" type="string">
+  HuggingFace reference or local path for the target model (e.g. `Qwen/Qwen3.5-9B`). If omitted, the model can be specified per-request in the HTTP body.
+</ParamField>
+
+<ParamField path="--draft-model" type="string">
+  DFlash draft model override. Also accepted as `--draft`. If not provided, the draft is resolved automatically from the built-in registry using the same longest-prefix rule as the `dflash` CLI.
+</ParamField>
+
+<ParamField path="--chat-template" type="string">
+  A Jinja2 chat template string for the tokenizer. Overrides the template bundled with the model.
+</ParamField>
+
+<ParamField path="--use-default-chat-template" type="bool">
+  Use the tokenizer's built-in default chat template. Useful when the model's bundled template is missing or invalid.
+</ParamField>
+
+<ParamField path="--chat-template-args" type="string">
+  JSON object passed as keyword arguments to `apply_chat_template`. Useful for toggling model-specific features such as `enable_thinking`. Example: `'{"enable_thinking": false}'`.
+</ParamField>
+
+### Network
+
+<ParamField path="--host" type="string">
+  Address the HTTP server binds to. Defaults to `127.0.0.1` (localhost only). Set to `0.0.0.0` to accept connections from other machines on the network.
+</ParamField>
+
+<ParamField path="--port" type="int">
+  TCP port the HTTP server listens on. Defaults to `8000`.
+</ParamField>
+
+### DFlash-specific
+
+<ParamField path="--dflash-max-ctx" type="int">
+  Maximum prompt token count for DFlash speculative decoding mode. Prompts longer than this value fall back to standard autoregressive generation. Useful when memory pressure from very long contexts would degrade speculative throughput. Must be `> 0` if provided.
+</ParamField>
+
+### Sampling defaults
+
+These values are used when the client does not specify the corresponding field in the request body.
+
+<ParamField path="--temp" type="float">
+  Default sampling temperature. Defaults to `0.0` (greedy / argmax decoding).
+</ParamField>
+
+<ParamField path="--top-p" type="float">
+  Default nucleus sampling probability mass threshold. Defaults to `1.0` (disabled).
+</ParamField>
+
+<ParamField path="--top-k" type="int">
+  Default top-k sampling. Defaults to `0` (disabled).
+</ParamField>
+
+<ParamField path="--min-p" type="float">
+  Default min-p sampling threshold. Defaults to `0.0` (disabled).
+</ParamField>
+
+<ParamField path="--max-tokens" type="int">
+  Default maximum number of tokens to generate per request. Defaults to `512`. Clients can override this per-request.
+</ParamField>
+
+### Caching and performance
+
+<ParamField path="--prompt-cache-size" type="int">
+  Maximum number of distinct KV-cache entries to hold in the LRU prompt cache. Higher values reduce prefill cost for repeated system prompts at the expense of memory. Defaults to `10`.
+</ParamField>
+
+<ParamField path="--prompt-cache-bytes" type="int">
+  Maximum total size in bytes for the LRU KV-cache pool. When set, individual cache entries are evicted to stay within this memory budget. No default (unbounded by default).
+</ParamField>
+
+### Logging
+
+<ParamField path="--log-level" type="string">
+  Python logging level for the server process. One of `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`. Defaults to `INFO`.
+</ParamField>
+
+## Startup banner
+
+On launch the server prints a summary to stderr confirming the target model, the resolved draft model (marked `auto-detected` or `explicit`), and the port:
+
+```
++--------------------------------------------------+
+| DFlash v0.1.0 - speculative decoding engine      |
+| Target: Qwen/Qwen3.5-9B                          |
+| Draft:  z-lab/Qwen3.5-9B-DFlash (auto-detected)  |
+| Mode:   DFlash (speculative decoding active)      |
+| Server: mlx_lm.server on port 8000               |
++--------------------------------------------------+
+```
+
+## Examples
+
+```bash
+# Minimal — model served on localhost:8000
+dflash-serve --model Qwen/Qwen3.5-9B
+
+# Explicit draft, different port
+dflash-serve \
+  --model Qwen/Qwen3.5-9B \
+  --draft z-lab/Qwen3.5-9B-DFlash \
+  --port 9000
+
+# Disable visible thinking tokens on a reasoning model
+dflash-serve --model Qwen/Qwen3.5-9B \
+  --chat-template-args '{"enable_thinking": false}'
+
+# Raise DFlash context threshold for a large quantized model
+dflash-serve \
+  --model mlx-community/Qwen3.5-35B-A3B-4bit \
+  --chat-template-args '{"enable_thinking": false}' \
+  --dflash-max-ctx 16384
+
+# Bind to all interfaces, debug logging
+dflash-serve --model Qwen/Qwen3.5-9B \
+  --host 0.0.0.0 --port 8000 \
+  --log-level DEBUG
+```
+
+## Using with OpenAI-compatible clients
+
+Point any OpenAI-compatible client at `http://127.0.0.1:8000` (or whichever host/port you chose). No API key is required by default.
+
+<CardGroup cols={2}>
+  <Card title="Open WebUI" icon="browser">
+    Add a new OpenAI-compatible connection in Settings → Connections with base URL `http://127.0.0.1:8000`.
+  </Card>
+  <Card title="Continue" icon="code">
+    Set `apiBase: "http://127.0.0.1:8000"` and `apiKey: "ignored"` in your `config.json` model entry.
+  </Card>
+  <Card title="aider" icon="terminal">
+    Pass `--openai-api-base http://127.0.0.1:8000` and `--openai-api-key ignored` when starting aider.
+  </Card>
+  <Card title="OpenCode" icon="sparkles">
+    Add a provider with `type: openai`, `baseUrl: "http://127.0.0.1:8000"`, and any non-empty `apiKey`.
+  </Card>
+</CardGroup>
+
+<Note>
+  `dflash-serve` supports streaming SSE (Server-Sent Events), tool / function calling, and reasoning / thinking tokens — the same feature surface as `mlx_lm.server`. The DFlash engine runs transparently underneath without changing the API contract.
+</Note>

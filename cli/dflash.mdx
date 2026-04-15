@@ -1,0 +1,93 @@
+---
+title: "dflash CLI Reference — Generate Text with DFlash"
+description: "Run speculative decoding inference from the terminal with the dflash command. Streams tokens to stdout, prints speed and acceptance stats to stderr."
+---
+
+The `dflash` command runs single-shot text generation using DFlash speculative decoding on Apple Silicon. It loads a target model and a paired draft model, streams generated tokens directly to stdout, and prints a performance summary (tokens/s and acceptance rate) to stderr when generation completes.
+
+## Synopsis
+
+```bash
+dflash --model <model-ref> --prompt <text> [options]
+```
+
+## Flags
+
+<ParamField path="--model" type="string" required>
+  HuggingFace model reference or local path for the **target** model (e.g. `Qwen/Qwen3.5-9B`). Must have a matching DFlash draft in the registry or you must supply `--draft` explicitly.
+</ParamField>
+
+<ParamField path="--prompt" type="string" required>
+  The prompt text to generate from. Pass as a shell-quoted string or expand from a variable.
+</ParamField>
+
+<ParamField path="--max-tokens" type="int">
+  Maximum number of tokens to generate. Defaults to `2048`.
+</ParamField>
+
+<ParamField path="--no-chat-template" type="bool">
+  Disable the model's chat template. By default the chat template is applied to the prompt before tokenization. Pass this flag to send the prompt text through the tokenizer without any template wrapping.
+</ParamField>
+
+<ParamField path="--draft" type="string">
+  Optional explicit draft model override. If omitted, the draft is resolved automatically from the built-in `DRAFT_REGISTRY` based on the target model name. Use this flag when you want to test a non-registry draft or a locally fine-tuned draft checkpoint.
+</ParamField>
+
+## Output
+
+Tokens are written incrementally to **stdout** as they are accepted, so you can pipe or redirect the generated text normally.
+
+When the stream ends, a one-line summary is printed to **stderr**:
+
+```
+512 tokens | 127.1 tok/s | 89.3% acceptance
+```
+
+- **tokens** — total accepted generation tokens (excludes the prompt)
+- **tok/s** — post-prefill generation throughput
+- **acceptance%** — fraction of draft tokens accepted by the target verifier
+
+## Draft auto-resolution
+
+If `--draft` is not provided, `dflash` strips the organization prefix from `--model` and looks up the remainder in the `DRAFT_REGISTRY`:
+
+| Target model name | Auto-resolved draft |
+|---|---|
+| `Qwen3.5-4B` | `z-lab/Qwen3.5-4B-DFlash` |
+| `Qwen3.5-9B` | `z-lab/Qwen3.5-9B-DFlash` |
+| `Qwen3.5-27B` | `z-lab/Qwen3.5-27B-DFlash` |
+| `Qwen3.5-35B-A3B` | `z-lab/Qwen3.5-35B-A3B-DFlash` |
+| `Qwen3-4B` | `z-lab/Qwen3-4B-DFlash-b16` |
+| `Qwen3-8B` | `z-lab/Qwen3-8B-DFlash-b16` |
+
+Prefix and suffix variants (e.g. `Qwen3.5-9B-Instruct`) are matched against registry keys using a longest-prefix rule, so most HuggingFace variants resolve without any extra flag.
+
+<Note>
+  If no matching draft is found and `--draft` is not provided, `dflash` exits with an error and lists the supported base model names. Supply `--draft` with any HuggingFace-hosted or local draft to bypass the registry.
+</Note>
+
+## Examples
+
+```bash
+# Minimal — draft auto-resolved from registry
+dflash --model Qwen/Qwen3.5-9B --prompt "Explain the Cauchy-Schwarz inequality."
+
+# Explicit draft model
+dflash \
+  --model Qwen/Qwen3.5-9B \
+  --draft z-lab/Qwen3.5-9B-DFlash \
+  --prompt "Explain the Cauchy-Schwarz inequality."
+
+# Long math reasoning prompt, 4096-token budget, raw prompt (no chat template)
+PROMPT='The function $f$ satisfies the functional equation \[ f(x) + f(y) = f(x + y) - xy - 1 \] for all real numbers $x$ and $y$. If $f(1) = 1$, then find all integers $n$ such that $f(n) = n$. Enter all such integers, separated by commas. Please reason step by step, and put your final answer within \boxed{}.'
+
+dflash --model Qwen/Qwen3.5-9B --prompt "$PROMPT" --max-tokens 4096
+
+# Pipe generated text into a file while watching stderr for stats
+dflash --model Qwen/Qwen3.5-4B --prompt "Write a haiku about MLX." \
+  > output.txt
+```
+
+<Tip>
+  For interactive use or multi-turn conversations, use `dflash-serve` instead — it exposes an OpenAI-compatible HTTP API that any chat client can connect to.
+</Tip>

@@ -1,97 +1,77 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "dflash-mlx: Lossless speculative decoding for Apple Silicon"
+description: "DFlash speculative decoding for MLX on Apple Silicon. Generate 16 draft tokens per pass, verify in one forward pass, achieve up to 4x throughput over baseline."
 ---
 
-## Setting up
+dflash-mlx brings lossless speculative decoding to Apple Silicon using the MLX framework. A small draft model generates 16 tokens in parallel with block diffusion; the target model verifies the entire block in a single forward pass. Every emitted token is the target model's greedy argmax — the output is indistinguishable from standard autoregressive generation.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Install dflash-mlx via pip or pipx and run your first generation in minutes
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Run the CLI, start the OpenAI-compatible server, and benchmark your model
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="How It Works" icon="microchip" href="/concepts/speculative-decoding">
+    Understand block diffusion drafting, greedy acceptance, and lossless verification
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="API Reference" icon="code" href="/api/runtime">
+    Python API for streaming generation, model loading, and cache management
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Key results
 
-Everything you need to create world-class documentation.
+On Apple M5 Max (64GB), dflash-mlx delivers consistent speedups over stock `mlx_lm.stream_generate`:
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+| Model | Tokens | Speedup | Acceptance |
+|-------|--------|---------|------------|
+| Qwen3.5-4B | 2048 | **4.10x** | 89.26% |
+| Qwen3.5-9B | 2048 | **4.13x** | 89.36% |
+| Qwen3.5-27B-4bit | 1024 | **1.98x** | 89.45% |
+| Qwen3.5-35B-A3B-4bit | 1024 | **1.74x** | 89.26% |
 
-## Need inspiration?
+## Get started
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<Steps>
+  <Step title="Install">
+    ```bash
+    pip install dflash-mlx
+    ```
+  </Step>
+  <Step title="Generate text">
+    ```bash
+    dflash --model Qwen/Qwen3.5-9B --prompt "Explain the Cauchy-Schwarz inequality"
+    ```
+    The draft model is resolved automatically — no `--draft` flag needed.
+  </Step>
+  <Step title="Start the server">
+    ```bash
+    dflash-serve --model Qwen/Qwen3.5-9B --port 8000
+    ```
+    Drop-in replacement for OpenAI-compatible clients: Open WebUI, Continue, aider, and more.
+  </Step>
+  <Step title="Benchmark">
+    ```bash
+    dflash-benchmark --model Qwen/Qwen3.5-9B --max-tokens 1024 --repeat 3
+    ```
+    Compare baseline vs DFlash throughput and acceptance rates side-by-side.
+  </Step>
+</Steps>
+
+## Explore the docs
+
+<CardGroup cols={2}>
+  <Card title="CLI reference" icon="terminal" href="/cli/dflash">
+    Full flag reference for `dflash`, `dflash-serve`, and `dflash-benchmark`
+  </Card>
+  <Card title="Supported models" icon="list" href="/models/supported-models">
+    Tested target/draft model pairs and architecture compatibility notes
+  </Card>
+  <Card title="Tape-replay rollback" icon="rotate-left" href="/concepts/tape-replay-rollback">
+    How dflash-mlx keeps GatedDeltaNet state coherent across speculative cycles
+  </Card>
+  <Card title="Environment variables" icon="gear" href="/api/environment-variables">
+    Tune context limits, draft window size, and profiling from the environment
+  </Card>
+</CardGroup>

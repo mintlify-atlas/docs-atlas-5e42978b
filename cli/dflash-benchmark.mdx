@@ -1,0 +1,184 @@
+---
+title: "dflash-benchmark CLI Reference — Speed & Acceptance"
+description: "Measure and compare DFlash speculative decoding throughput against a stock MLX baseline, with per-run JSON reports and thermal-aware cooldown."
+---
+
+`dflash-benchmark` runs a head-to-head throughput comparison between the stock `mlx_lm` autoregressive baseline and the DFlash speculative decoding runtime. Each run loads both model stacks sequentially, generates the same prompt to the same token budget, and reports generation speed (tok/s), acceptance rate, and wall-clock speedup. Results are written as JSON to `benchmark/results/` and also printed to stdout.
+
+## Synopsis
+
+```bash
+dflash-benchmark --prompt <text> [options]
+```
+
+## Flags
+
+### Required
+
+<ParamField path="--prompt" type="string" required>
+  The prompt text used for both the baseline and DFlash generation passes. All runs in a benchmark session use the same prompt.
+</ParamField>
+
+### Models
+
+<ParamField path="--model" type="string">
+  HuggingFace reference or local path for the target model. Effectively required — if omitted, the runtime raises a `ValueError` when attempting to resolve the model path.
+</ParamField>
+
+<ParamField path="--draft" type="string">
+  DFlash draft model reference. If omitted, the draft is resolved automatically from the registry (same rule as the `dflash` CLI).
+</ParamField>
+
+### Generation budget
+
+<ParamField path="--max-tokens" type="int">
+  Number of new tokens to generate per run. Defaults to `64`. Increase this for stable throughput measurements — short sequences have high variance due to prefill dominance.
+</ParamField>
+
+<ParamField path="--block-tokens" type="int">
+  Number of draft tokens generated per speculative block. Defaults to `16`. Increasing this drafts more tokens per cycle but may reduce acceptance rate on harder prompts.
+</ParamField>
+
+<ParamField path="--verify-chunk-tokens" type="int">
+  Override the number of tokens verified per chunk within a block. Defaults to `None` (runtime-determined).
+</ParamField>
+
+<ParamField path="--no-chat-template" type="bool">
+  Disable the chat template when tokenizing the prompt. By default the chat template is applied, matching the behavior of `dflash` and `dflash-serve`.
+</ParamField>
+
+<ParamField path="--no-eos" type="bool">
+  Suppress end-of-sequence tokens so generation always runs to `--max-tokens`. Recommended for throughput benchmarks — without this flag, models that emit EOS early produce incomparable run lengths. This is the flag used for all official benchmark results.
+</ParamField>
+
+### Repeat and cooldown
+
+<ParamField path="--repeat" type="int">
+  Number of measured runs. When `--matrix` is set and `--repeat` is omitted, defaults to `3`. For single-run mode (`--matrix` not set), defaults to `1`. When `--repeat > 1`, matrix mode is activated automatically. The summary reports the **median** over all runs.
+</ParamField>
+
+<ParamField path="--cooldown" type="int">
+  Seconds to sleep between consecutive runs for thermal stabilization. Defaults to `10`. Reduce this for quick iteration; increase it (e.g. `30`) when the chip is already warm or benchmark results show throttling warnings.
+</ParamField>
+
+<ParamField path="--matrix" type="bool">
+  Force matrix mode even with `--repeat 1`. In matrix mode the benchmark wrapper iterates over runs explicitly and aggregates into a `summary` block. Single-run mode calls `benchmark_once` directly.
+</ParamField>
+
+### Hardware and precision
+
+<ParamField path="--quantize-draft" type="bool">
+  Load the draft model in quantized form. Off by default.
+</ParamField>
+
+<ParamField path="--split-sdpa" type="bool">
+  Enable `split_full_attention_sdpa` when loading the target model. Enabled by default (`--no-split-sdpa` to disable). This controls a custom SDPA kernel path used for long-context verification.
+</ParamField>
+
+## Output format
+
+Each benchmark run emits a JSON report to stdout and saves it to `benchmark/results/<model-slug>-<max_tokens>.json`. The top-level keys are:
+
+```json
+{
+  "hardware": { "chip": "...", "memory_gb": "64", "mlx_version": "...", "python": "..." },
+  "config": { "target_model": "...", "draft_model": "...", "max_new_tokens": 1024, ... },
+  "runs": [
+    {
+      "run": 1,
+      "thermal_pressure": "nominal",
+      "baseline": { "ttft_ms": 412.3, "generation_tps": 31.1, "peak_memory_gb": 18.2 },
+      "dflash":   { "ttft_ms": 438.1, "generation_tps": 127.5, "acceptance_ratio": 0.893,
+                    "tokens_per_cycle": 14.3, "cycles": 64, "peak_memory_gb": 22.1 },
+      "speedup": 4.10
+    }
+  ],
+  "summary": {
+    "baseline_tps_median": 31.09,
+    "dflash_tps_median": 127.47,
+    "dflash_tps_min": 125.8,
+    "dflash_tps_max": 129.1,
+    "speedup_median": 4.10,
+    "acceptance_ratio_median": 0.893
+  }
+}
+```
+
+Key metrics in the summary block:
+
+| Field | Description |
+|---|---|
+| `baseline_tps_median` | Median post-prefill tok/s for the stock autoregressive baseline |
+| `dflash_tps_median` | Median post-prefill tok/s for DFlash |
+| `dflash_tps_min` | Minimum DFlash tok/s across all runs |
+| `dflash_tps_max` | Maximum DFlash tok/s across all runs |
+| `speedup_median` | `dflash_tps / baseline_tps` — generation-phase speedup ratio |
+| `acceptance_ratio_median` | Fraction of draft tokens accepted across the run (0.0 – 1.0) |
+
+Per-run entries also include `tokens_per_cycle` (average accepted tokens per speculative cycle), `ttft_ms` for both systems, and thermal pressure at the time of measurement.
+
+## Methodology
+
+<Steps>
+  <Step title="Thermal check">
+    Before each run, `pmset` is queried for CPU scheduler limit. If the chip is throttled (below 100% scheduler limit), a warning is printed to stderr. Increase `--cooldown` or wait for the chip to cool.
+  </Step>
+  <Step title="Baseline run">
+    The target model is loaded fresh as a pristine `mlx_lm` instance and `mlx_lm.stream_generate` is called. The model is then unloaded and the Metal cache is cleared.
+  </Step>
+  <Step title="DFlash run">
+    The target model is reloaded with the DFlash runtime patches and paired with the draft model. `generate_dflash_once` is called with identical token budget and prompt.
+  </Step>
+  <Step title="Cooldown">
+    Between runs, the process sleeps for `--cooldown` seconds (default 10 s) to allow the chip to return to nominal thermal state.
+  </Step>
+  <Step title="Aggregation">
+    When `--repeat > 1`, the median is reported across all runs. Individual per-run entries are retained in the `runs` array of the JSON report.
+  </Step>
+</Steps>
+
+<Note>
+  Official benchmark results in the README use `--no-eos`, `--repeat 3`, `--cooldown 10`, and `--max-tokens` values of 1024 / 2048 / 4096. Reproduce them with the same flags to get comparable numbers.
+</Note>
+
+## Example
+
+```bash
+# Single run, 1024 tokens, no EOS suppression for fair length comparison
+dflash-benchmark \
+  --model Qwen/Qwen3.5-9B \
+  --draft z-lab/Qwen3.5-9B-DFlash \
+  --prompt "The function \$f\$ satisfies the functional equation..." \
+  --max-tokens 1024 \
+  --repeat 3 \
+  --no-eos
+
+# Quick local check with shorter budget and no cooldown
+dflash-benchmark \
+  --model Qwen/Qwen3.5-4B \
+  --prompt "Summarize the attention mechanism." \
+  --max-tokens 128 \
+  --no-eos \
+  --cooldown 0
+
+# Matrix mode, explicit block size
+dflash-benchmark \
+  --model Qwen/Qwen3.5-9B \
+  --draft z-lab/Qwen3.5-9B-DFlash \
+  --prompt "Write a proof of the prime number theorem." \
+  --max-tokens 2048 \
+  --block-tokens 16 \
+  --repeat 3 \
+  --matrix \
+  --no-eos
+```
+
+## JSON report location
+
+Reports are saved automatically to `benchmark/results/` relative to the working directory, using a slug derived from the model name and `--max-tokens`:
+
+```
+benchmark/results/qwen3-5-9b-1024.json
+```
+
+Full per-model JSON reports from the official benchmark run are committed to the repository under [`benchmark/results/`](https://github.com/bstnxbt/dflash-mlx/tree/main/benchmark/results).

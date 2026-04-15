@@ -1,0 +1,140 @@
+---
+title: "Numerical Coherence in Speculative Cycles"
+description: "How dflash-mlx pads GatedDeltaNet projections to M=16 and uses a 2-pass Metal SDPA kernel to keep accepted tokens numerically stable in speculative cycles."
+---
+
+Speculative decoding introduces a subtle numerical hazard: the target model is now called in two different sequence-length configurations — a long verify pass covering the full draft block, and short single-token passes during normal autoregressive operation. In bf16, small differences in the number of elements processed by a matrix multiply or an attention kernel can shift rounding enough to change the argmax. If the verify pass and the subsequent single-token pass would disagree on the same position, the lossless guarantee breaks. dflash-mlx addresses this with two targeted interventions: padding for small GatedDeltaNet projections and a 2-pass attention kernel for long-context verify.
+
+## bf16 sensitivity in GatedDeltaNet projections
+
+The `in_proj_b` and `in_proj_a` projections inside GatedDeltaNet are small: they produce `[B, S, Hv]`-shaped outputs where `S` is the sequence length being processed. When `S < 16`, MLX may dispatch these matrix multiplies with a different GEMM tile size than when `S == 16` (the block size used in the verify pass). The tiling change shifts accumulated rounding error in bf16 even when the mathematical result is identical.
+
+### `_ExactSmallProjPad`
+
+`_ExactSmallProjPad` (`runtime.py:256`) wraps any `nn.Linear` layer and pads the sequence dimension up to `pad_m = 16` before the forward pass, then slices the result back:
+
+```python
+class _ExactSmallProjPad(nn.Module):
+    def __init__(self, linear: nn.Module, *, pad_m: int = 16):
+        super().__init__()
+        self.linear = linear
+        self.pad_m = int(pad_m)
+        self._dflash_exact_small_proj_wrapped = True
+
+    def __call__(self, x: mx.array) -> mx.array:
+        if x.ndim == 3 and x.shape[1] < self.pad_m:
+            batch_size, seq_len, hidden_dim = x.shape
+            pad = mx.zeros((batch_size, self.pad_m - seq_len, hidden_dim), dtype=x.dtype)
+            out = self.linear(mx.concatenate([x, pad], axis=1))
+            return out[:, :seq_len, :]
+        return self.linear(x)
+```
+
+When the input sequence length is already `>= pad_m`, the wrapper is a no-op and adds zero overhead. The `_dflash_exact_small_proj_wrapped` flag prevents double-wrapping.
+
+Padding to `M=16` means `in_proj_b` and `in_proj_a` always see the same tile footprint regardless of whether the call comes from a single-token autoregressive step (`S=1`) or the 16-token verify pass (`S=16`). The padding rows are zeros and do not affect the valid output positions.
+
+### `_install_exact_small_proj_hooks`
+
+The wrapper is installed on every GatedDeltaNet layer in `_install_exact_small_proj_hooks` (`runtime.py:288`):
+
+```python
+def _install_exact_small_proj_hooks(
+    linear_attn: Any,
+    *,
+    pad_m: int = 16,
+) -> None:
+    for attr_name in ("in_proj_b", "in_proj_a"):
+        proj = getattr(linear_attn, attr_name, None)
+        if proj is None or getattr(proj, "_dflash_exact_small_proj_wrapped", False):
+            continue
+        setattr(linear_attn, attr_name, _ExactSmallProjPad(proj, pad_m=pad_m))
+```
+
+This is called from `_install_target_speculative_hooks`, which iterates over all model layers and applies it to every layer where `layer.is_linear` is `True` and `layer.linear_attn` exists.
+
+## JIT SDPA 2-pass: `batched_sdpa_2pass_exact`
+
+The hybrid attention layers (non-linear layers in Qwen3.5) use standard scaled-dot-product attention. When the KV cache grows to `N >= 1024` keys, the stock MLX `scaled_dot_product_attention` kernel can diverge numerically from the single-key (`N=1`) autoregressive case due to online softmax accumulation order in bf16.
+
+`batched_sdpa_2pass_exact` (`kernels.py:658`) is a custom Metal kernel that splits the attention computation into two passes — partials then reduce — using `float32` accumulators for the softmax statistics even though inputs and outputs remain in bf16/fp16:
+
+```python
+def batched_sdpa_2pass_exact(
+    queries: mx.array,   # [B, Hq, 16, D]
+    keys: mx.array,      # [B, Hk, N, D]
+    values: mx.array,    # [B, Hk, N, V]
+    scale: float,
+    mask: Optional[mx.array] = None,
+) -> Optional[mx.array]:  # [B, Hq, 16, V]  or None if conditions not met
+```
+
+The kernel returns `None` if any precondition fails, and the caller (`_install_split_full_attention_hook`) falls back to a chunked single-query path.
+
+### When the 2-pass kernel activates
+
+The conditions are checked inside the patched attention `__call__` (`runtime.py:587`):
+
+```python
+should_use_batched_2pass = (
+    should_split                            # cache present and N >= 1024
+    and int(queries.shape[2]) == 16         # exactly 16 query positions (verify block)
+    and queries.dtype in (mx.bfloat16, mx.float16)
+    and int(queries.shape[-1]) in (128, 256)
+    and int(values.shape[-1]) in (128, 256)
+)
+```
+
+`should_split` itself requires:
+
+```python
+should_split = (
+    cache is not None
+    and cached_prefix_len >= _HYBRID_SDPA_EXACT_KV_THRESHOLD  # 1024
+    and (mask is None or mask == "causal" or isinstance(mask, mx.array))
+)
+```
+
+So the 2-pass kernel fires only during a verify pass over a full 16-token block when the context is at least 1024 tokens long and head dimension is 128 or 256. Single-token autoregressive steps (`q_len=1`) do not match `q_len == 16` and take the normal stock SDPA path.
+
+## `_install_split_full_attention_hook`
+
+The attention patching is installed by `_install_split_full_attention_hook` (`runtime.py:527`). It replaces the `__call__` method on the attention class in-place (once, via a class-level flag):
+
+```python
+def _install_split_full_attention_hook(attn: Any) -> None:
+    cls = type(attn)
+    if getattr(cls, "_dflash_split_full_attention_installed", False):
+        return
+    original_call = cls.__call__
+    # ... defines split_call wrapping original_call ...
+    cls.__call__ = split_call
+    cls._dflash_split_full_attention_installed = True
+```
+
+The hook is gated on `self._dflash_split_sdpa_enabled`, which is set per-layer by `configure_full_attention_split`. This flag is `False` by default and set to `True` only for hybrid models when `split_full_attention_sdpa=True` (the default in `load_target_bundle`). An additional guard checks `_attention_has_gated_q_proj` to confirm the layer has the gated-Q structure of Qwen3.5 hybrid attention before applying the split path.
+
+## Threshold conditions summary
+
+<Steps>
+  <Step title="Model family check">
+    `detect_target_family` inspects the model layers for `linear_attn` or `is_linear` attributes. If none are found, the model is classified `pure_attention` and no hooks are installed at all — skipping both the small-proj padding and the 2-pass SDPA.
+  </Step>
+  <Step title="Small-proj padding threshold">
+    Activates whenever `x.shape[1] < 16` (i.e., any pass shorter than the full block size). This covers single-token AR steps and intermediate verify chunks.
+  </Step>
+  <Step title="2-pass SDPA threshold">
+    Activates when `cached_prefix_len >= 1024`, `q_len == 16`, and head dim is 128 or 256. Below 1024 keys the stock kernel is numerically sufficient.
+  </Step>
+  <Step title="Full acceptance bypass">
+    When the entire 16-token block is accepted, rollback is skipped entirely (`_clear_rollback_state`), so neither the tape-replay kernel nor the recurrent state reconstruction runs. Numerical coherence in this path is maintained purely by the padding hook.
+  </Step>
+</Steps>
+
+<Tip>
+  Pure-attention models (e.g., Qwen3) work with dflash-mlx but do not benefit from tape-replay rollback or the small-projection padding — there are no GatedDeltaNet layers to stabilize. The 2-pass SDPA kernel may still fire for long-context verify passes if the gated-Q projection check passes.
+</Tip>
+
+<Note>
+  The `_EXACT_SMALL_PROJ_PAD_M = 16` constant (`runtime.py:253`) is intentionally matched to `block_size = 16`. If a future DFlash variant uses a different block size, both constants must be updated together to maintain numerical alignment between verify and autoregressive passes.
+</Note>

@@ -1,0 +1,438 @@
+---
+title: 'dflash_mlx.runtime — Core Runtime API'
+description: 'Load target and draft models, create KV caches, and run speculative decoding with stream_dflash_generate and generate_dflash_once.'
+---
+
+The `dflash_mlx.runtime` module is the primary entry point for DFlash speculative decoding on Apple Silicon. It provides functions to load hybrid GatedDeltaNet/attention target models and lightweight draft models, build per-layer KV caches with rollback support, and execute block-parallel speculative generation. All public functions are safe to call from Python scripts and Jupyter notebooks.
+
+---
+
+## `load_target_bundle()`
+
+Load a target language model together with its tokenizer and a metadata dictionary. The function resolves the model reference to a local path or Hugging Face repo, detects whether the architecture is a hybrid GatedDeltaNet model or a pure-attention model, and installs the speculative forward hooks needed for `stream_dflash_generate`.
+
+```python
+from dflash_mlx.runtime import load_target_bundle
+
+model, tokenizer, meta = load_target_bundle(
+    "mlx-community/Qwen3-8B-4bit",
+    lazy=True,
+    split_full_attention_sdpa=True,
+    split_full_attention_chunk_size=8,
+)
+print(meta["target_family"])  # "hybrid_gdn" or "pure_attention"
+```
+
+### Parameters
+
+<ParamField path="model_ref" type="str | Path | None" required>
+  Local filesystem path or Hugging Face repo ID for the target model. Supports `~` expansion. Raises `ValueError` if `None`.
+</ParamField>
+
+<ParamField path="lazy" type="bool" default="True">
+  When `True`, weights are loaded lazily and evaluated on first use. Set to `False` to force eager loading.
+</ParamField>
+
+<ParamField path="pack_target_weights" type="bool" default="False">
+  Enables selective weight packing for MLP layers. Packing metadata is stored in `meta["packing"]`.
+</ParamField>
+
+<ParamField path="pack_attention_weights" type="bool" default="False">
+  When `True` and `pack_target_weights` is also `True`, attention projection weights are packed in addition to MLP weights.
+</ParamField>
+
+<ParamField path="validate_packing" type="bool" default="True">
+  Run a correctness check on the packed weight layout. Disable to skip validation overhead after confirming correctness.
+</ParamField>
+
+<ParamField path="split_full_attention_sdpa" type="bool" default="True">
+  Enable chunked SDPA for full-attention layers in hybrid models. Has no effect on pure-attention models. Automatically disabled when `quantize_kv_cache=True`.
+</ParamField>
+
+<ParamField path="split_full_attention_chunk_size" type="int" default="8">
+  Query chunk size (in tokens) used when chunked SDPA is active. Smaller values reduce peak memory during verification at the cost of throughput.
+</ParamField>
+
+<ParamField path="quantize_kv_cache" type="bool" default="False">
+  Use 8-bit quantized KV caches for attention layers. Reduces memory at the cost of a small accuracy penalty. Automatically disables `split_full_attention_sdpa`.
+</ParamField>
+
+### Returns
+
+A 3-tuple `(model, tokenizer, meta_dict)`.
+
+<ResponseField name="model" type="Any">
+  The loaded `mlx-lm` model object with speculative hooks installed.
+</ResponseField>
+
+<ResponseField name="tokenizer" type="Any">
+  The `mlx-lm` tokenizer for the target model.
+</ResponseField>
+
+<ResponseField name="meta_dict" type="dict[str, Any]">
+  Metadata about the loaded bundle.
+
+  <Expandable title="properties">
+    <ResponseField name="resolved_model_ref" type="str">
+      Absolute path or repo ID that was actually loaded.
+    </ResponseField>
+    <ResponseField name="config" type="dict">
+      Raw model configuration dictionary from `config.json`.
+    </ResponseField>
+    <ResponseField name="quantize_kv_cache" type="bool">
+      Whether quantized KV caches are active.
+    </ResponseField>
+    <ResponseField name="target_family" type="str">
+      `"hybrid_gdn"` for GatedDeltaNet hybrid models, `"pure_attention"` for standard transformer models.
+    </ResponseField>
+    <ResponseField name="packing" type="dict">
+      Present only when `pack_target_weights=True`. Contains packing metadata including `packed_mlp_layers` and `packed_attention_layers`.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+---
+
+## `load_draft_bundle()`
+
+Load a DFlash draft model and its configuration. The draft model is a small, task-specific network that proposes token blocks for the target to verify. Optionally applies 4-bit quantization to further reduce memory and latency.
+
+```python
+from dflash_mlx.runtime import load_draft_bundle
+
+draft_model, draft_meta = load_draft_bundle(
+    "z-lab/Qwen3-8B-DFlash-b16",
+    lazy=True,
+    quantize_draft=False,
+)
+```
+
+### Parameters
+
+<ParamField path="model_ref" type="str | Path | None" required>
+  Local path or Hugging Face repo ID for the DFlash draft model. Downloaded automatically via `huggingface_hub` when not found locally.
+</ParamField>
+
+<ParamField path="lazy" type="bool" default="True">
+  Lazy weight loading. Matches the behaviour of the same parameter in `load_target_bundle`.
+</ParamField>
+
+<ParamField path="quantize_draft" type="bool" default="False">
+  Apply 4-bit, group-size-64 quantization to the draft model weights. Can also be enabled via the `DFLASH_QUANTIZE_DRAFT` environment variable.
+</ParamField>
+
+### Returns
+
+A 2-tuple `(draft_model, config_dict)`.
+
+<ResponseField name="draft_model" type="DFlashDraftModel">
+  The loaded `DFlashDraftModel` instance.
+</ResponseField>
+
+<ResponseField name="config_dict" type="dict[str, Any]">
+  Draft model metadata.
+
+  <Expandable title="properties">
+    <ResponseField name="resolved_model_ref" type="str">
+      The model reference string that was used for loading.
+    </ResponseField>
+    <ResponseField name="config" type="dict">
+      Raw model configuration dictionary.
+    </ResponseField>
+    <ResponseField name="quantize_draft" type="bool">
+      Whether quantization was applied.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+---
+
+## `stream_dflash_generate()`
+
+The primary streaming generation interface. Runs DFlash block-parallel speculative decoding and yields event dictionaries for every prefill completion, every committed token, and a final summary. Falls back to autoregressive generation when the prompt exceeds `DFLASH_MAX_CTX` (default 4096 tokens).
+
+```python
+from dflash_mlx.runtime import load_target_bundle, load_draft_bundle, stream_dflash_generate
+from dflash_mlx.generate import get_stop_token_ids, decode_token
+
+model, tokenizer, _ = load_target_bundle("mlx-community/Qwen3-8B-4bit")
+draft_model, _ = load_draft_bundle("z-lab/Qwen3-8B-DFlash-b16")
+
+stop_ids = get_stop_token_ids(tokenizer)
+
+for event in stream_dflash_generate(
+    target_model=model,
+    tokenizer=tokenizer,
+    draft_model=draft_model,
+    prompt="Explain speculative decoding in one paragraph.",
+    max_new_tokens=256,
+    use_chat_template=True,
+    stop_token_ids=stop_ids,
+):
+    if event["event"] == "token":
+        print(decode_token(tokenizer, event["token_id"]), end="", flush=True)
+    elif event["event"] == "summary":
+        ratio = event["acceptance_ratio"]
+        print(f"\n\nAcceptance ratio: {ratio:.2%}")
+```
+
+### Parameters
+
+<ParamField path="target_model" type="Any" required>
+  Target model loaded by `load_target_bundle`. Must have speculative hooks installed.
+</ParamField>
+
+<ParamField path="tokenizer" type="Any" required>
+  Tokenizer returned by `load_target_bundle`.
+</ParamField>
+
+<ParamField path="draft_model" type="DFlashDraftModel" required>
+  Draft model loaded by `load_draft_bundle`.
+</ParamField>
+
+<ParamField path="prompt" type="str" required>
+  Input prompt string. Tokenized internally unless `prompt_tokens_override` is set.
+</ParamField>
+
+<ParamField path="max_new_tokens" type="int" required>
+  Maximum number of tokens to generate, not counting the prompt.
+</ParamField>
+
+<ParamField path="use_chat_template" type="bool" default="False">
+  Apply the tokenizer's chat template before encoding. Wraps the prompt as a single user turn and adds the generation prompt.
+</ParamField>
+
+<ParamField path="block_tokens" type="Optional[int]" default="None">
+  Number of tokens to draft per speculative cycle. Defaults to the draft model's `block_size`. Values larger than `block_size` are clamped.
+</ParamField>
+
+<ParamField path="stop_token_ids" type="Optional[list[int]]" default="None">
+  Token IDs that halt generation when any appear in a committed block. Use `get_stop_token_ids(tokenizer)` to obtain EOS tokens.
+</ParamField>
+
+<ParamField path="suppress_token_ids" type="Optional[list[int]]" default="None">
+  Token IDs to mask out of the logit distribution during greedy sampling. Applied to both target and draft sampling.
+</ParamField>
+
+<ParamField path="prompt_tokens_override" type="Optional[list[int]]" default="None">
+  Pre-tokenized prompt as a list of integer token IDs. When set, `prompt` and `use_chat_template` are ignored for tokenization.
+</ParamField>
+
+<ParamField path="quantize_kv_cache" type="bool" default="False">
+  Enable 8-bit quantized KV caches for this generation run. Should match the value passed to `load_target_bundle`.
+</ParamField>
+
+### Yields
+
+Event dictionaries with an `"event"` key. Three event types are emitted:
+
+**`"prefill"` event** — emitted once after the prompt is processed.
+
+<ResponseField name="event" type="str">
+  Always `"prefill"`.
+</ResponseField>
+<ResponseField name="prefill_us" type="float">
+  Time spent processing the prompt, in microseconds.
+</ResponseField>
+<ResponseField name="prompt_token_count" type="int">
+  Number of tokens in the encoded prompt.
+</ResponseField>
+
+**`"token"` event** — emitted for every token added to the output.
+
+<ResponseField name="event" type="str">
+  Always `"token"`.
+</ResponseField>
+<ResponseField name="token_id" type="int">
+  The integer token ID of the generated token.
+</ResponseField>
+<ResponseField name="generated_tokens" type="int">
+  Running count of tokens generated so far.
+</ResponseField>
+<ResponseField name="acceptance_ratio" type="float">
+  Fraction of generated tokens accepted from the draft so far (excludes the staged first token of each cycle).
+</ResponseField>
+<ResponseField name="cycles_completed" type="int">
+  Number of speculative cycles completed so far.
+</ResponseField>
+
+**`"summary"` event** — emitted once after generation ends.
+
+<ResponseField name="event" type="str">
+  Always `"summary"`.
+</ResponseField>
+<ResponseField name="elapsed_us" type="float">
+  Total wall-clock time for generation in microseconds (includes prefill).
+</ResponseField>
+<ResponseField name="prompt_token_count" type="int">
+  Number of tokens in the encoded prompt.
+</ResponseField>
+<ResponseField name="generated_token_ids" type="list[int]">
+  Complete list of generated token IDs in order.
+</ResponseField>
+<ResponseField name="generation_tokens" type="int">
+  Total number of generated tokens.
+</ResponseField>
+<ResponseField name="accepted_from_draft" type="int">
+  Number of tokens that were accepted directly from draft proposals.
+</ResponseField>
+<ResponseField name="acceptance_ratio" type="float">
+  `accepted_from_draft / generation_tokens`. Higher is better; 1.0 means every drafted token was accepted.
+</ResponseField>
+<ResponseField name="block_tokens" type="int">
+  Effective block size used during generation.
+</ResponseField>
+<ResponseField name="cycles_completed" type="int">
+  Total number of speculative cycles executed.
+</ResponseField>
+<ResponseField name="phase_timings_us" type="dict[str, float]">
+  Per-phase timing breakdown in microseconds.
+
+  <Expandable title="properties">
+    <ResponseField name="prefill" type="float">Time for target model prompt prefill.</ResponseField>
+    <ResponseField name="draft" type="float">Total draft model forward time.</ResponseField>
+    <ResponseField name="draft_prefill" type="float">Draft time for the first (prefill) cycle only.</ResponseField>
+    <ResponseField name="draft_incremental" type="float">Draft time for subsequent (incremental) cycles.</ResponseField>
+    <ResponseField name="verify" type="float">Total target model verify forward time.</ResponseField>
+    <ResponseField name="replay" type="float">Total recurrent state rollback time.</ResponseField>
+    <ResponseField name="commit" type="float">Total bookkeeping time after each cycle (includes replay).</ResponseField>
+  </Expandable>
+</ResponseField>
+<ResponseField name="verify_len_cap" type="int">
+  Maximum verification window size used, controlled by `DFLASH_VERIFY_LEN`.
+</ResponseField>
+
+<Note>
+  Set the environment variable `DFLASH_PROFILE=1` before generation to include per-cycle timing data under `cycle_profile_us` and `cycle_profile_totals_us` in the summary event.
+</Note>
+
+---
+
+## `generate_dflash_once()`
+
+Non-streaming variant of `stream_dflash_generate`. Runs the full speculative decoding loop and returns a single result dictionary. Useful for benchmarking where intermediate token streaming is not needed.
+
+```python
+from dflash_mlx.runtime import generate_dflash_once
+
+result = generate_dflash_once(
+    target_model=model,
+    tokenizer=tokenizer,
+    draft_model=draft_model,
+    prompt="What is machine learning?",
+    max_new_tokens=128,
+    use_chat_template=True,
+)
+print(result["acceptance_ratio"])
+print(result["generation_tokens"])
+```
+
+### Parameters
+
+Same as `stream_dflash_generate`, plus:
+
+<ParamField path="verify_chunk_tokens" type="Optional[int]" default="None">
+  Split the verification forward pass into chunks of this size. When set, the speculative linear cache is disabled. Useful for very long contexts where a single large verify pass would exceed memory.
+</ParamField>
+
+### Returns
+
+<ResponseField name="result" type="dict[str, Any]">
+  A dictionary with all fields present in the `"summary"` event from `stream_dflash_generate`, plus:
+
+  <Expandable title="additional fields">
+    <ResponseField name="speculative_linear_cache" type="bool">
+      Whether the `RecurrentRollbackCache` was used for linear attention layers.
+    </ResponseField>
+    <ResponseField name="verify_chunk_tokens" type="Optional[int]">
+      The verification chunk size, or `None` if chunking was not used.
+    </ResponseField>
+    <ResponseField name="tokens_per_cycle" type="float">
+      Average committed tokens per speculative cycle.
+    </ResponseField>
+    <ResponseField name="acceptance_first_20_avg" type="float">
+      Mean acceptance length for the first 20 speculative cycles.
+    </ResponseField>
+    <ResponseField name="acceptance_last_20_avg" type="float">
+      Mean acceptance length for the last 20 speculative cycles.
+    </ResponseField>
+    <ResponseField name="peak_memory_gb" type="Optional[float]">
+      Peak Metal memory in gigabytes, or `None` if unavailable.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+---
+
+## `make_target_cache()`
+
+Build a per-layer list of cache objects matched to the target model architecture. Linear attention layers receive a `RecurrentRollbackCache` when speculative decoding is enabled; full-attention layers receive a standard `KVCache` or `QuantizedKVCache`.
+
+```python
+from dflash_mlx.runtime import make_target_cache
+
+cache = make_target_cache(
+    model,
+    enable_speculative_linear_cache=True,
+    quantize_kv_cache=False,
+)
+```
+
+### Parameters
+
+<ParamField path="target_model" type="Any" required>
+  Target model returned by `load_target_bundle`.
+</ParamField>
+
+<ParamField path="enable_speculative_linear_cache" type="bool" required>
+  When `True`, linear attention layers use `RecurrentRollbackCache` to support rollback. When `False`, they use a plain `ArraysCache`.
+</ParamField>
+
+<ParamField path="quantize_kv_cache" type="bool" default="False">
+  Use `QuantizedKVCache` (8-bit, group size 64) for full-attention layers instead of `KVCache`.
+</ParamField>
+
+### Returns
+
+<ResponseField name="caches" type="list[Any]">
+  A list of cache objects, one per model layer, in layer order.
+</ResponseField>
+
+---
+
+## `detect_target_family()`
+
+Inspect a loaded target model and return its architecture family string. Used internally by `load_target_bundle` to decide which hooks to install.
+
+```python
+from dflash_mlx.runtime import detect_target_family
+
+family = detect_target_family(model)
+# "hybrid_gdn"   — model has GatedDeltaNet linear attention layers
+# "pure_attention" — standard transformer, no linear layers
+```
+
+### Parameters
+
+<ParamField path="target_model" type="Any" required>
+  Target model returned by `load_target_bundle` or `mlx_lm.utils.load`.
+</ParamField>
+
+### Returns
+
+<ResponseField name="family" type="str">
+  `"hybrid_gdn"` when the model contains at least one layer with a `linear_attn` or `is_linear` attribute; `"pure_attention"` otherwise.
+</ResponseField>
+
+---
+
+## Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `DFLASH_MAX_CTX` | `4096` | Prompt token limit before falling back to autoregressive generation. |
+| `DFLASH_VERIFY_LEN` | _(block size)_ | Override the maximum verification window per cycle. |
+| `DFLASH_DRAFT_SINK` | `64` | Sink token count for the draft model's sliding window cache. |
+| `DFLASH_DRAFT_WINDOW` | `1024` | Window size for the draft model's sliding window cache. |
+| `DFLASH_QUANTIZE_DRAFT` | _(off)_ | Set to `1` to quantize the draft model without code changes. |
+| `DFLASH_PROFILE` | _(off)_ | Set to `1` to include per-cycle timing in the summary event. |

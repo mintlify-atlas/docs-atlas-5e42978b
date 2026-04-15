@@ -1,0 +1,69 @@
+{
+  "projectType": "ai-ml",
+  "projectName": "dflash-mlx",
+  "projectDescription": "Lossless DFlash speculative decoding for Apple Silicon that generates 16 tokens per draft pass and achieves up to 4x inference speedup over baseline MLX.",
+  "theme": "luma",
+  "primaryColor": "#94cb04",
+  "lightColor": "#545454",
+  "darkColor": null,
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": ["introduction", "installation", "quickstart"]
+          },
+          {
+            "group": "How It Works",
+            "pages": ["concepts/speculative-decoding", "concepts/tape-replay-rollback", "concepts/numerical-coherence"]
+          },
+          {
+            "group": "CLI Reference",
+            "pages": ["cli/dflash", "cli/dflash-serve", "cli/dflash-benchmark"]
+          },
+          {
+            "group": "Model Compatibility",
+            "pages": ["models/supported-models", "models/draft-registry"]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Python API",
+            "pages": ["api/runtime", "api/generate", "api/recurrent-rollback-cache"]
+          },
+          {
+            "group": "Configuration",
+            "pages": ["api/environment-variables", "api/benchmarks"]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Block diffusion draft generates 16 tokens per pass — target verifies in one forward pass",
+    "Lossless output — every emitted token is verified against the target model before commit",
+    "Tape-replay rollback for GatedDeltaNet recurrent state without full snapshot overhead",
+    "JIT SDPA 2-pass custom Metal kernel for numerically aligned long-context verification",
+    "Auto draft resolution — no manual --draft flag required for supported models",
+    "OpenAI-compatible server with streaming SSE, tools, and reasoning support",
+    "Up to 4.13x speedup over baseline MLX on Apple M5 Max with 89% acceptance rate"
+  ],
+  "publicApiSurface": [
+    "dflash (CLI) — generate text with DFlash speculative decoding",
+    "dflash-serve (CLI) — OpenAI-compatible HTTP server using DFlash runtime",
+    "dflash-benchmark (CLI) — measure and compare baseline vs DFlash throughput",
+    "stream_dflash_generate() — streaming Python iterator for DFlash generation",
+    "generate_dflash_once() — single-shot DFlash generation returning summary dict",
+    "load_target_bundle() — load and configure target model with speculative hooks",
+    "load_draft_bundle() — load DFlash draft model",
+    "RecurrentRollbackCache — cache for GatedDeltaNet layers with tape-replay rollback",
+    "make_target_cache() — build per-layer cache list for target model",
+    "resolve_optional_draft_ref() — auto-resolve draft model from registry",
+    "DRAFT_REGISTRY — mapping of base model names to HuggingFace draft model refs"
+  ]
+}
